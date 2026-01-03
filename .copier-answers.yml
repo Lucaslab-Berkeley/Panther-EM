@@ -1,0 +1,12 @@
+# Do not edit - changes here will be overwritten by Copier
+_commit: v1
+_src_path: gh:pydev-guide/pyrepo-copier
+author_email: mdgiammar@gmail.com
+author_name: Matthew Giammar
+github_username: mgiammar
+mode: tooling
+module_name: panther_em
+project_name: panther-em
+project_short_description: Pipelined AcceleratioN of Template matcHing via Eigendecomposition
+    of Rotational projections in cryo-EM
+
