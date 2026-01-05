@@ -45,8 +45,6 @@ def get_polar_projections_from_volume(
 
     angles_shape = np.broadcast(phi, theta, psi).shape
 
-    print("DEBUG - angles_shape:", angles_shape)
-
     phi = np.broadcast_to(phi, angles_shape).ravel()
     theta = np.broadcast_to(theta, angles_shape).ravel()
     psi = np.broadcast_to(psi, angles_shape).ravel()
