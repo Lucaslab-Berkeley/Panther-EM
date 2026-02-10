@@ -45,8 +45,7 @@ dependencies = [
     "mrcfile",
     "torch",
     "matplotlib",
-    # "torch-fourier-slice",
-    "torch-fourier-slice @ git+https://github.com/teamtomo/torch-fourier-slice@mdg_improved_projection_generation",
+    "torch-fourier-slice",
     "ipykernel"
 ]
 

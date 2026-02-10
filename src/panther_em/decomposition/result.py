@@ -3,7 +3,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
@@ -48,7 +47,7 @@ class DecompositionResult:
     # Timestamp
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Validate shapes after initialization."""
         expected_sv_shape = (self.k_max, self.num_radial_components)
         expected_vec_shape = (
@@ -67,6 +66,8 @@ class DecompositionResult:
                 f"right_singular_vectors shape {self.right_singular_vectors.shape} "
                 f"does not match expected {expected_vec_shape}"
             )
+
+        return
 
     def save(self, path: str | Path) -> None:
         """Save decomposition result to disk.
@@ -110,6 +111,7 @@ class DecompositionResult:
 
         return cls(
             singular_values=data["singular_values"],
+            left_singular_vectors=data["left_singular_vectors"],
             right_singular_vectors=data["right_singular_vectors"],
             num_orientations=int(data["num_orientations"]),
             num_angular_components=int(data["num_angular_components"]),
@@ -133,7 +135,7 @@ class DecompositionResult:
         complex
             The singular value.
         """
-        return self.singular_values[k_idx, eig_idx]
+        return complex(self.singular_values[k_idx, eig_idx])
 
     def get_radial_eigenvector(self, k_idx: int, eig_idx: int) -> np.ndarray:
         """Get a specific radial eigenvector.

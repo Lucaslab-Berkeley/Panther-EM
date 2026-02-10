@@ -7,7 +7,7 @@ import numpy as np
 from panther_em.decomposition.result import DecompositionResult
 from panther_em.utils import (
     get_polar_projections_from_volume,
-    warp_polar_inverse,
+    warp_offset_polar_inverse,
 )
 
 
@@ -20,12 +20,12 @@ class PolarProjectionDecomposer:
 
     Parameters
     ----------
+    volume : np.ndarray
+        The 3D volume to decompose.
     phi_values : np.ndarray
         Phi values, in degrees of ZYZ Euler angles, for projection orientations.
     theta_values : np.ndarray
         Theta values, in degrees of ZYZ Euler angles, for projection orientations.
-    volume : np.ndarray
-        The 3D volume to decompose.
 
     Attributes
     ----------
@@ -101,13 +101,6 @@ class PolarProjectionDecomposer:
             psi=0.0,
         )
         num_orients, num_angular_comp, num_radial_comp = projections_polar.shape
-        
-        ### DEBUGGING: Print the shape of the projections
-        print(f"DEBUG - projections_polar shape: {projections_polar.shape}")
-        print(f"DEBUG - num_orients: {num_orients}")
-        print(f"DEBUG - num_angular_comp: {num_angular_comp}")
-        print(f"DEBUG - num_radial_comp: {num_radial_comp}")
-        ### END DEBUGGING
 
         projections_fft = np.fft.fft(projections_polar, axis=1)  # Along angular dim
 
@@ -135,39 +128,10 @@ class PolarProjectionDecomposer:
             u, s, vh = np.linalg.svd(
                 freq_block_scaled, full_matrices=False, compute_uv=True
             )
-            
-            ### DEBUGGING: Print the shapes of the SVD outputs
-            print(f"DEBUG - k={k}: freq_block shape: {freq_block.shape}")
-            print(f"DEBUG - k={k}: u shape: {u.shape}, s shape: {s.shape}, vh shape: {vh.shape}")
-            ### END DEBUGGING
-            
+
             singular_values[k] = s
             left_singular_vectors[k] = u
             right_singular_vectors[k] = vh.conj().T
-
-        # # # Evaluate the SVD separately on each frequency block
-        # # singular_values = np.zeros((k_max, num_radial_comp), dtype=np.complex64)
-        # # singular_vectors = np.zeros(
-        # #     (k_max, num_radial_comp, num_radial_comp), dtype=np.complex64
-        # # )
-
-        # for k in range(k_max):
-        #     freq_block = projections_fft[:, k, :]
-        #     freq_block_conj = np.conjugate(freq_block)
-        #     radial_block = freq_block_conj.T @ freq_block
-
-        #     # Reweight by the radius of the components
-        #     r = np.arange(num_radial_comp)
-        #     radial_block_scaled = (
-        #         (r[:, None] * r[None, :]) * radial_block / (num_radial_comp**2)
-        #     )
-
-        #     # Do eigenvalue decomposition
-        #     values, vectors = np.linalg.eig(radial_block_scaled)
-
-        #     # Save singular values and radial component of singular vectors
-        #     singular_values[k] = np.sqrt(values)
-        #     singular_vectors[k] = vectors
 
         # Create and store the result
         self._result = DecompositionResult(
@@ -226,9 +190,11 @@ class PolarProjectionDecomposer:
         k_idx: int,
         eig_idx: int,
         output_shape: tuple[int, int] | None = None,
-        scaling: str = "linear",
     ) -> np.ndarray:
         """Construct a single Cartesian feature for an angular frequency and eigenvalue.
+
+        Uses the offset polar coordinate system for better spatial coverage when
+        transforming from polar to cartesian space.
 
         Parameters
         ----------
@@ -239,9 +205,6 @@ class PolarProjectionDecomposer:
         output_shape : tuple[int, int] | None, optional
             Shape of the output Cartesian image. If None, uses the volume's
             spatial dimensions. Default is None.
-        scaling : str, optional
-            Radial scaling mode for polar to Cartesian conversion.
-            Default is "linear".
 
         Returns
         -------
@@ -258,17 +221,16 @@ class PolarProjectionDecomposer:
         if output_shape is None:
             output_shape = (self.volume.shape[-2], self.volume.shape[-1])
 
+        # Transform real and imaginary parts separately using offset polar inverse
         cartesian_feature = np.zeros(output_shape, dtype=np.complex64)
 
-        cartesian_feature.real = warp_polar_inverse(
+        cartesian_feature.real = warp_offset_polar_inverse(
             polar_feature.real,
             output_shape=output_shape,
-            scaling=scaling,
         )
-        cartesian_feature.imag = warp_polar_inverse(
+        cartesian_feature.imag = warp_offset_polar_inverse(
             polar_feature.imag,
             output_shape=output_shape,
-            scaling=scaling,
         )
 
         return cartesian_feature
