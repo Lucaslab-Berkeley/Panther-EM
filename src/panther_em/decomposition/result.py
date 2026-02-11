@@ -66,6 +66,15 @@ class DecompositionResult:
                 f"right_singular_vectors shape {self.right_singular_vectors.shape} "
                 f"does not match expected {expected_vec_shape}"
             )
+            
+    def __repr__(self) -> str:
+        """String representation of the DecompositionResult."""
+        return (
+            f"DecompositionResult(num_orientations={self.num_orientations}, "
+            f"num_angular_components={self.num_angular_components}, "
+            f"num_radial_components={self.num_radial_components}, "
+            f"k_max={self.k_max}, created_at='{self.created_at}')"
+        )
 
         return
 

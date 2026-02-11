@@ -39,13 +39,16 @@ classifiers = [
 ]
 # add your package dependencies here
 dependencies = [
+    "tqdm",
     "numpy",
     "scipy",
     "scikit-image",
     "mrcfile",
     "torch",
     "matplotlib",
+    "ttsim3d",
     "torch-fourier-slice",
+    "torch-so3",
     "ipykernel"
 ]
 
