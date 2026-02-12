@@ -1,9 +1,10 @@
 """Polar projection decomposition for cryo-EM volumes."""
 
 from pathlib import Path
-import tqdm
+
 import numpy as np
 import torch
+import tqdm
 
 from panther_em.decomposition.result import DecompositionResult
 from panther_em.utils import (
@@ -44,7 +45,7 @@ class PolarProjectionDecomposer:
     Examples
     --------
     >>> # assume volume, phi, theta are defined
-    >>> decomposer = PolarProjectionDecomposer(volume, phi, theta, device='cuda')
+    >>> decomposer = PolarProjectionDecomposer(volume, phi, theta, device="cuda")
     >>> result = decomposer.do_decomposition()
     >>> result.save("decomposition.npz")
     """
@@ -129,8 +130,6 @@ class PolarProjectionDecomposer:
                     self.num_angular_components,
                     self.num_radial_components,
                 ),
-                "scaling": "linear",
-                "mode": "wrap",  # Angular dimension is periodic
             }
         else:
             warp_polar_kwargs = None
@@ -312,13 +311,14 @@ class PolarProjectionDecomposer:
         -------
         np.ndarray
             Reconstructed projection (complex-valued).
-            Shape is (num_angular_components, num_radial_components) if return_polar=True,
-            otherwise output_shape.
+            Shape is (num_angular_components, num_radial_components) if return_polar is
+            True, otherwise output_shape.
 
         Raises
         ------
         ValueError
-            If decomposition has not been performed yet or orientation_idx is out of bounds.
+            If decomposition has not been performed yet or orientation_idx is out of
+            bounds.
         """
         result = self.result  # Will raise if not decomposed
 
@@ -383,15 +383,17 @@ class PolarProjectionDecomposer:
             output_shape = (self.volume.shape[-2], self.volume.shape[-1])
 
         cartesian_projection = np.zeros(output_shape, dtype=np.complex128)
-        cartesian_projection.real = warp_polar_inverse(
+        cartesian_projection.real = warp_offset_polar_inverse(
             polar_projection_np.real,
+            center=None,
+            radius=None,
             output_shape=output_shape,
-            scaling=scaling,
         )
-        cartesian_projection.imag = warp_polar_inverse(
+        cartesian_projection.imag = warp_offset_polar_inverse(
             polar_projection_np.imag,
+            center=None,
+            radius=None,
             output_shape=output_shape,
-            scaling=scaling,
         )
 
         return cartesian_projection
