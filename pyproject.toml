@@ -49,13 +49,15 @@ dependencies = [
     "ttsim3d",
     "torch-fourier-slice",
     "torch-so3",
-    "ipykernel"
+    "roma",
+    "ipykernel",
 ]
 
 # https://peps.python.org/pep-0621/#dependencies-optional-dependencies
 # add dependencies for "extra" features here.  Not dev dependencies.
-# [project.optional-dependencies]
-# name = ["dependency"]
+[project.optional-dependencies]
+cuda13 = ["cupy-cuda13x", "cucim-cu13"]
+cuda12 = ["cupy-cuda12x", "cucim-cu12"]
 
 [project.urls]
 homepage = "https://github.com/mgiammar/panther-em"
@@ -78,9 +80,9 @@ dev = [
     { include-group = "test" },
     "ipython",
     "mypy",
-    "pdbpp",  # https://github.com/pdbpp/pdbpp
+    "pdbpp",                    # https://github.com/pdbpp/pdbpp
     "pre-commit-uv",
-    "rich",  # https://github.com/Textualize/rich
+    "rich",                     # https://github.com/Textualize/rich
     "ruff",
 ]
 
@@ -123,7 +125,7 @@ ignore = [
 # https://docs.astral.sh/ruff/formatter/
 [tool.ruff.format]
 docstring-code-format = true
-skip-magic-trailing-comma = false  # default is false
+skip-magic-trailing-comma = false # default is false
 
 # https://docs.pytest.org/
 [tool.pytest.ini_options]
