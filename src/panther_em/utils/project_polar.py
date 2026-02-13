@@ -14,7 +14,7 @@ def get_polar_projections_from_volume(
     theta: float | np.ndarray,
     psi: float | np.ndarray = 0.0,
     num_angle: int = 360,
-    num_radius: int | None = None,
+    num_radius: int = 256,
     warp_polar_kwargs: dict | None = None,
 ) -> np.ndarray:
     """Generate 2D projections from a 3D volume in offset polar coordinates.
@@ -79,6 +79,10 @@ def get_polar_projections_from_volume(
 
     projections = projections.numpy()
 
+    # Constants for the warp function
+    center = (projections.shape[1] / 2, projections.shape[2] / 2)
+    radius = projections.shape[1] / 2  # Assuming square projections
+
     # Warp each projection to offset polar coordinates
     projections_polar = []
     for i in range(projections.shape[0]):
@@ -86,6 +90,8 @@ def get_polar_projections_from_volume(
             projections[i],
             num_angle=num_angle,
             num_radius=num_radius,
+            center=center,
+            radius=radius,
             **warp_polar_kwargs,
         )
         projections_polar.append(proj_polar)

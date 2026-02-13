@@ -165,7 +165,8 @@ def inverse_offset_polar_to_cartesian_mapping(
     angle_offset = (ring_idx % 2) * (delta_theta / 2)
     angle_with_offset = angle + angle_offset
 
-    angle_with_offset = angle
+    # # NOTE: Testing to remove the offset
+    # angle_with_offset = angle
 
     # Convert from polar to cartesian
     row = radius * np.sin(angle_with_offset) + center[0]
@@ -240,7 +241,8 @@ def inverse_cartesian_to_offset_polar_mapping(
         angle_adjusted >= 2 * np.pi, angle_adjusted - 2 * np.pi, angle_adjusted
     )
 
-    angle_adjusted = angle
+    # # NOTE: Testing to remove the offset
+    # angle_adjusted = angle
 
     # Convert to angle index
     angle_idx = (angle_adjusted / (2 * np.pi)) * num_angle

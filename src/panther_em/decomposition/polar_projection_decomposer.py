@@ -7,10 +7,8 @@ import torch
 import tqdm
 
 from panther_em.decomposition.result import DecompositionResult
-from panther_em.utils import (
-    get_polar_projections_from_volume,
-    warp_offset_polar_inverse,
-)
+from panther_em.utils import get_polar_projections_from_volume
+from panther_em.utils.warp_transforms import OffsetPolarTransform
 
 
 class PolarProjectionDecomposer:
@@ -28,12 +26,10 @@ class PolarProjectionDecomposer:
         Phi values, in degrees of ZYZ Euler angles, for projection orientations.
     theta_values : np.ndarray
         Theta values, in degrees of ZYZ Euler angles, for projection orientations.
-    num_radial_components : int | None, optional
+    num_radius : int
         Number of radial components in polar projections.
-        If None, then the number of radial components are calculated automatically.
-    num_angular_components : int | None, optional
-        Number of angular components in polar projections.
-        If None, then number of angular components is set to 360.
+    num_angle : int, optional
+        Number of angular components in polar projections. Default is 360.
     device : str | torch.device, optional
         Device to use for computation ('cpu', 'cuda', etc.). Default is 'cpu'.
 
@@ -41,11 +37,15 @@ class PolarProjectionDecomposer:
     ----------
     result : DecompositionResult | None
         The decomposition result after calling `do_decomposition()`.
+    polar_transform : OffsetPolarTransform | None
+        Transform object for efficient polar<->cartesian conversion after decomposition.
 
     Examples
     --------
     >>> # assume volume, phi, theta are defined
-    >>> decomposer = PolarProjectionDecomposer(volume, phi, theta, device="cuda")
+    >>> decomposer = PolarProjectionDecomposer(
+    ...     volume, phi, theta, num_radius=256, num_angle=720, device="cuda"
+    ... )
     >>> result = decomposer.do_decomposition()
     >>> result.save("decomposition.npz")
     """
@@ -55,26 +55,18 @@ class PolarProjectionDecomposer:
         volume: np.ndarray,
         phi_values: np.ndarray,
         theta_values: np.ndarray,
-        num_radial_components: int | None = None,
-        num_angular_components: int = 360,
+        num_radius: int,
+        num_angle: int = 360,
         device: str | torch.device = "cpu",
     ) -> None:
         self.volume = volume
         self.phi_values = phi_values
         self.theta_values = theta_values
-
-        # Either both must be set or both must be None
-        if (num_radial_components is None) != (num_angular_components is None):
-            raise ValueError(
-                "Either both num_radial_components and num_angular_components "
-                "must be set, or both must be None."
-            )
-
-        # Set the values (None handled in projection generation step)
-        self.num_radial_components = num_radial_components
-        self.num_angular_components = num_angular_components
+        self.num_radius = num_radius
+        self.num_angle = num_angle
 
         self._result: DecompositionResult | None = None
+        self._polar_transform: OffsetPolarTransform | None = None
         self.device = torch.device(device)
 
     @property
@@ -102,6 +94,26 @@ class PolarProjectionDecomposer:
         """Check if decomposition has been performed."""
         return self._result is not None
 
+    @property
+    def polar_transform(self) -> OffsetPolarTransform:
+        """Access the polar transform for coordinate conversions.
+
+        Returns
+        -------
+        OffsetPolarTransform
+            Transform object with cached coordinate mappings.
+
+        Raises
+        ------
+        ValueError
+            If decomposition has not been performed yet.
+        """
+        if self._polar_transform is None:
+            raise ValueError(
+                "Polar transform not available. Call do_decomposition() first."
+            )
+        return self._polar_transform
+
     def do_decomposition(self, k_max: int | None = None) -> DecompositionResult:
         """Run the block-circulant decomposition using the held orientations.
 
@@ -120,27 +132,21 @@ class PolarProjectionDecomposer:
             The decomposition result containing singular values and vectors.
         """
         # Generate projections on-the-fly (memory efficient)
-        # Note: get_polar_projections_from_volume returns numpy array
-        if (
-            self.num_radial_components is not None
-            and self.num_angular_components is not None
-        ):
-            warp_polar_kwargs = {
-                "output_shape": (
-                    self.num_angular_components,
-                    self.num_radial_components,
-                ),
-            }
-        else:
-            warp_polar_kwargs = None
         projections_polar = get_polar_projections_from_volume(
             volume=self.volume,
             phi=self.phi_values,
             theta=self.theta_values,
             psi=0.0,
-            warp_polar_kwargs=warp_polar_kwargs,
+            warp_polar_kwargs=None,
         )
-        num_orients, num_angular_comp, num_radial_comp = projections_polar.shape
+        num_orients, num_angle, num_radius = projections_polar.shape
+
+        # Create the polar transform for later use in reconstruction
+        self._polar_transform = OffsetPolarTransform.from_image(
+            image_shape=(self.volume.shape[-2], self.volume.shape[-1]),
+            num_angle=num_angle,
+            num_radius=num_radius,
+        )
 
         # Convert to torch tensor and move to device
         projections_polar = torch.from_numpy(projections_polar).to(
@@ -152,19 +158,19 @@ class PolarProjectionDecomposer:
 
         # Determine k_max
         if k_max is None:
-            k_max = num_angular_comp
+            k_max = num_angle
 
         # Iterate over all angular frequency components and store the SVD results
         singular_values = torch.zeros(
-            (k_max, num_radial_comp), dtype=torch.float32, device=self.device
+            (k_max, num_radius), dtype=torch.float32, device=self.device
         )
         left_singular_vectors = torch.zeros(
-            (k_max, num_orients, num_radial_comp),
+            (k_max, num_orients, num_radius),
             dtype=torch.complex64,
             device=self.device,
         )
         right_singular_vectors = torch.zeros(
-            (k_max, num_radial_comp, num_radial_comp),
+            (k_max, num_radius, num_radius),
             dtype=torch.complex64,
             device=self.device,
         )
@@ -173,8 +179,8 @@ class PolarProjectionDecomposer:
             freq_block = projections_fft[:, k, :]
 
             # Scale by the radial component (proper integration term $r dr$)
-            r = torch.arange(num_radial_comp, device=self.device, dtype=torch.float32)
-            r = r / num_radial_comp
+            r = torch.arange(num_radius, device=self.device, dtype=torch.float32)
+            r = r / num_radius
             freq_block_scaled = freq_block * r[None, :]
 
             # Call SVD on the scaled frequency block
@@ -190,8 +196,8 @@ class PolarProjectionDecomposer:
             left_singular_vectors=left_singular_vectors.cpu().numpy(),
             right_singular_vectors=right_singular_vectors.cpu().numpy(),
             num_orientations=num_orients,
-            num_angular_components=num_angular_comp,
-            num_radial_components=num_radial_comp,
+            num_angular_components=num_angle,
+            num_radial_components=num_radius,
             k_max=k_max,
         )
 
@@ -208,7 +214,7 @@ class PolarProjectionDecomposer:
         Returns
         -------
         torch.Tensor
-            Angular phase array with shape (num_angular_components,).
+            Angular phase array with shape (num_angle,).
         """
         result = self.result
         angles = (
@@ -228,7 +234,7 @@ class PolarProjectionDecomposer:
         Parameters
         ----------
         radial_component : torch.Tensor
-            Radial component with shape (num_radial_components,).
+            Radial component with shape (num_radius,).
 
         Returns
         -------
@@ -260,7 +266,7 @@ class PolarProjectionDecomposer:
         -------
         np.ndarray
             A complex np.ndarray for the feature in polar space with shape
-            (num_angular_components, num_radial_components).
+            (num_angle, num_radius).
 
         Raises
         ------
@@ -285,8 +291,9 @@ class PolarProjectionDecomposer:
         orientation_idx: int,
         num_components: int | None = None,
         output_shape: tuple[int, int] | None = None,
-        scaling: str = "linear",
         return_polar: bool = False,
+        order: int = 5,
+        mode: str = "symmetric",
     ) -> np.ndarray:
         """Reconstruct a Cartesian projection at a specific orientation.
 
@@ -300,19 +307,22 @@ class PolarProjectionDecomposer:
         output_shape : tuple[int, int] | None, optional
             Shape of the output Cartesian image. If None, uses the volume's
             spatial dimensions. Default is None.
-        scaling : str, optional
-            Radial scaling mode for polar to Cartesian conversion.
-            Default is "linear".
         return_polar : bool, optional
             If True, returns the polar representation instead of converting
             to Cartesian. Default is False.
+        order : int, optional
+            Interpolation order for polar to cartesian conversion (0-5).
+            Default is 5.
+        mode : str, optional
+            How to handle values outside boundaries during warping.
+            Default is "symmetric".
 
         Returns
         -------
         np.ndarray
             Reconstructed projection (complex-valued).
-            Shape is (num_angular_components, num_radial_components) if return_polar is
-            True, otherwise output_shape.
+            Shape is (num_angle, num_radius) if return_polar is True,
+            otherwise output_shape.
 
         Raises
         ------
@@ -378,23 +388,22 @@ class PolarProjectionDecomposer:
         if return_polar:
             return polar_projection_np
 
-        # Convert to Cartesian space
-        if output_shape is None:
-            output_shape = (self.volume.shape[-2], self.volume.shape[-1])
-
-        cartesian_projection = np.zeros(output_shape, dtype=np.complex128)
-        cartesian_projection.real = warp_offset_polar_inverse(
-            polar_projection_np.real,
-            center=None,
-            radius=None,
-            output_shape=output_shape,
-        )
-        cartesian_projection.imag = warp_offset_polar_inverse(
-            polar_projection_np.imag,
-            center=None,
-            radius=None,
-            output_shape=output_shape,
-        )
+        # Convert to Cartesian space using cached transform
+        if output_shape is not None:
+            # Need to create a new transform if output shape differs
+            temp_transform = OffsetPolarTransform.from_image(
+                image_shape=output_shape,
+                num_angle=result.num_angular_components,
+                num_radius=result.num_radial_components,
+            )
+            cartesian_projection = temp_transform.to_cartesian(
+                polar_projection_np, order=order, mode=mode
+            )
+        else:
+            # Use cached transform
+            cartesian_projection = self.polar_transform.to_cartesian(
+                polar_projection_np, order=order, mode=mode
+            )
 
         return cartesian_projection
 
@@ -403,6 +412,8 @@ class PolarProjectionDecomposer:
         k_idx: int,
         eig_idx: int,
         output_shape: tuple[int, int] | None = None,
+        order: int = 5,
+        mode: str = "symmetric",
     ) -> np.ndarray:
         """Construct a single Cartesian feature for an angular frequency and eigenvalue.
 
@@ -418,6 +429,12 @@ class PolarProjectionDecomposer:
         output_shape : tuple[int, int] | None, optional
             Shape of the output Cartesian image. If None, uses the volume's
             spatial dimensions. Default is None.
+        order : int, optional
+            Interpolation order for polar to cartesian conversion (0-5).
+            Default is 5.
+        mode : str, optional
+            How to handle values outside boundaries during warping.
+            Default is "symmetric".
 
         Returns
         -------
@@ -431,20 +448,23 @@ class PolarProjectionDecomposer:
         """
         polar_feature = self.construct_polar_feature(k_idx, eig_idx)
 
-        if output_shape is None:
-            output_shape = (self.volume.shape[-2], self.volume.shape[-1])
-
-        # Transform real and imaginary parts separately using offset polar inverse
-        cartesian_feature = np.zeros(output_shape, dtype=np.complex64)
-
-        cartesian_feature.real = warp_offset_polar_inverse(
-            polar_feature.real,
-            output_shape=output_shape,
-        )
-        cartesian_feature.imag = warp_offset_polar_inverse(
-            polar_feature.imag,
-            output_shape=output_shape,
-        )
+        # Convert to cartesian using cached transform
+        if output_shape is not None:
+            # Need to create a new transform if output shape differs
+            result = self.result
+            temp_transform = OffsetPolarTransform.from_image(
+                image_shape=output_shape,
+                num_angle=result.num_angular_components,
+                num_radius=result.num_radial_components,
+            )
+            cartesian_feature = temp_transform.to_cartesian(
+                polar_feature, order=order, mode=mode
+            )
+        else:
+            # Use cached transform
+            cartesian_feature = self.polar_transform.to_cartesian(
+                polar_feature, order=order, mode=mode
+            )
 
         return cartesian_feature
 
@@ -462,6 +482,14 @@ class PolarProjectionDecomposer:
             If decomposition has not been performed yet.
         """
         self.result.save(path)
+
+    def clear_polar_transform_cache(self) -> None:
+        """Clear the cached coordinate mappings in the polar transform.
+
+        This can free up memory when the transform is no longer needed.
+        """
+        if self._polar_transform is not None:
+            self._polar_transform.clear_cache()
 
     @classmethod
     def from_result(
@@ -504,7 +532,21 @@ class PolarProjectionDecomposer:
         if theta_values is None:
             theta_values = np.zeros(result.num_orientations)
 
-        instance = cls(volume, phi_values, theta_values, device=device)
+        instance = cls(
+            volume,
+            phi_values,
+            theta_values,
+            num_radius=result.num_radial_components,
+            num_angle=result.num_angular_components,
+            device=device,
+        )
         instance._result = result
+
+        # Create the polar transform
+        instance._polar_transform = OffsetPolarTransform.from_image(
+            image_shape=(volume.shape[-2], volume.shape[-1]),
+            num_angle=result.num_angular_components,
+            num_radius=result.num_radial_components,
+        )
 
         return instance
