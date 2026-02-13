@@ -10,6 +10,11 @@ from panther_em.decomposition.result import DecompositionResult
 from panther_em.utils import get_polar_projections_from_volume
 from panther_em.utils.warp_transforms import OffsetPolarTransform
 
+# TODO: Large numbers of projections (orientations) and high polar resolutions
+# (number of angular and radial components) can lead to OOM errors on GPUs. Need to
+# implements a batched way to handle portions of the data at a time handing off
+# memory between CPU/GPU.
+
 
 class PolarProjectionDecomposer:
     """Manages projection generation and block-circulant data decomposition.
@@ -20,18 +25,18 @@ class PolarProjectionDecomposer:
 
     Parameters
     ----------
-    volume : np.ndarray
-        The 3D volume to decompose.
-    phi_values : np.ndarray
+    volume : np.ndarray | torch.Tensor
+        The 3D volume to decompose. If torch.Tensor, should be on the target device.
+    phi_values : np.ndarray | torch.Tensor
         Phi values, in degrees of ZYZ Euler angles, for projection orientations.
-    theta_values : np.ndarray
+    theta_values : np.ndarray | torch.Tensor
         Theta values, in degrees of ZYZ Euler angles, for projection orientations.
     num_radius : int
         Number of radial components in polar projections.
     num_angle : int, optional
         Number of angular components in polar projections. Default is 360.
     device : str | torch.device, optional
-        Device to use for computation ('cpu', 'cuda', etc.). Default is 'cpu'.
+        Device to use for computation ('cpu', 'cuda', 'cuda:0', etc.). Default is 'cpu'.
 
     Attributes
     ----------
@@ -42,9 +47,18 @@ class PolarProjectionDecomposer:
 
     Examples
     --------
-    >>> # assume volume, phi, theta are defined
+    >>> # CPU computation with numpy
     >>> decomposer = PolarProjectionDecomposer(
-    ...     volume, phi, theta, num_radius=256, num_angle=720, device="cuda"
+    ...     volume, phi, theta, num_radius=256, num_angle=720, device="cpu"
+    ... )
+    >>> result = decomposer.do_decomposition()
+
+    >>> # GPU computation with torch tensors
+    >>> volume_gpu = torch.from_numpy(volume).cuda()
+    >>> phi_gpu = torch.from_numpy(phi).cuda()
+    >>> theta_gpu = torch.from_numpy(theta).cuda()
+    >>> decomposer = PolarProjectionDecomposer(
+    ...     volume_gpu, phi_gpu, theta_gpu, num_radius=256, num_angle=720, device="cuda"
     ... )
     >>> result = decomposer.do_decomposition()
     >>> result.save("decomposition.npz")
@@ -52,22 +66,37 @@ class PolarProjectionDecomposer:
 
     def __init__(
         self,
-        volume: np.ndarray,
-        phi_values: np.ndarray,
-        theta_values: np.ndarray,
+        volume: np.ndarray | torch.Tensor,
+        phi_values: np.ndarray | torch.Tensor,
+        theta_values: np.ndarray | torch.Tensor,
         num_radius: int,
         num_angle: int = 360,
         device: str | torch.device = "cpu",
     ) -> None:
-        self.volume = volume
-        self.phi_values = phi_values
-        self.theta_values = theta_values
+        """Initialize the polar projection decomposer."""
+        self.device = torch.device(device)
+
+        # Convert inputs to tensors on the correct device
+        if isinstance(volume, np.ndarray):
+            self.volume = torch.from_numpy(volume).to(self.device)
+        else:
+            self.volume = volume.to(self.device)
+
+        if isinstance(phi_values, np.ndarray):
+            self.phi_values = torch.from_numpy(phi_values).to(self.device)
+        else:
+            self.phi_values = phi_values.to(self.device)
+
+        if isinstance(theta_values, np.ndarray):
+            self.theta_values = torch.from_numpy(theta_values).to(self.device)
+        else:
+            self.theta_values = theta_values.to(self.device)
+
         self.num_radius = num_radius
         self.num_angle = num_angle
 
         self._result: DecompositionResult | None = None
         self._polar_transform: OffsetPolarTransform | None = None
-        self.device = torch.device(device)
 
     @property
     def result(self) -> DecompositionResult:
@@ -132,26 +161,32 @@ class PolarProjectionDecomposer:
             The decomposition result containing singular values and vectors.
         """
         # Generate projections on-the-fly (memory efficient)
+        # This will use GPU if inputs are on GPU
         projections_polar = get_polar_projections_from_volume(
             volume=self.volume,
             phi=self.phi_values,
             theta=self.theta_values,
             psi=0.0,
-            warp_polar_kwargs=None,
+            num_angle=self.num_angle,
+            num_radius=self.num_radius,
         )
         num_orients, num_angle, num_radius = projections_polar.shape
+
+        # Determine device string for OffsetPolarTransform
+        transform_device = "cuda" if self.device.type == "cuda" else "numpy"
 
         # Create the polar transform for later use in reconstruction
         self._polar_transform = OffsetPolarTransform.from_image(
             image_shape=(self.volume.shape[-2], self.volume.shape[-1]),
             num_angle=num_angle,
             num_radius=num_radius,
+            device=transform_device,
         )
 
-        # Convert to torch tensor and move to device
-        projections_polar = torch.from_numpy(projections_polar).to(
-            device=self.device, dtype=torch.complex64
-        )
+        # Ensure projections are complex and on correct device
+        if not projections_polar.is_complex():
+            projections_polar = projections_polar.to(dtype=torch.complex64)
+        projections_polar = projections_polar.to(self.device)
 
         # FFT along angular dimension
         projections_fft = torch.fft.fft(projections_polar, dim=1)
@@ -192,7 +227,7 @@ class PolarProjectionDecomposer:
 
         # Convert results back to numpy for storage
         self._result = DecompositionResult(
-            singular_values=singular_values.cpu().numpy().astype(np.complex64),
+            singular_values=singular_values.cpu().numpy().astype(np.float32),
             left_singular_vectors=left_singular_vectors.cpu().numpy(),
             right_singular_vectors=right_singular_vectors.cpu().numpy(),
             num_orientations=num_orients,
@@ -251,8 +286,9 @@ class PolarProjectionDecomposer:
         # Avoid division by zero at r=0
         return radial_component / torch.where(r > 0, r, torch.ones_like(r))
 
-    # @torch.compile
-    def construct_polar_feature(self, k_idx: int, eig_idx: int) -> np.ndarray:
+    def construct_polar_feature(
+        self, k_idx: int, eig_idx: int, return_torch: bool = False
+    ) -> np.ndarray | torch.Tensor:
         """Construct a single polar feature for an angular frequency and eigenvalue.
 
         Parameters
@@ -261,11 +297,14 @@ class PolarProjectionDecomposer:
             The index of the angular frequency component.
         eig_idx : int
             The index of the eigenvector to use.
+        return_torch : bool, optional
+            If True, returns a torch.Tensor on the device.
+            Otherwise returns numpy array. Default is False.
 
         Returns
         -------
-        np.ndarray
-            A complex np.ndarray for the feature in polar space with shape
+        np.ndarray | torch.Tensor
+            A complex array for the feature in polar space with shape
             (num_angle, num_radius).
 
         Raises
@@ -284,6 +323,8 @@ class PolarProjectionDecomposer:
         # Construct the feature by taking the outer product
         polar_feature = torch.outer(angular_component, radial_component)
 
+        if return_torch:  # Ensure return_torch is handled correctly
+            return polar_feature
         return polar_feature.cpu().numpy()
 
     def reconstruct_projection(
@@ -292,9 +333,10 @@ class PolarProjectionDecomposer:
         num_components: int | None = None,
         output_shape: tuple[int, int] | None = None,
         return_polar: bool = False,
+        return_torch: bool = False,
         order: int = 5,
         mode: str = "symmetric",
-    ) -> np.ndarray:
+    ) -> np.ndarray | torch.Tensor:
         """Reconstruct a Cartesian projection at a specific orientation.
 
         Parameters
@@ -310,6 +352,9 @@ class PolarProjectionDecomposer:
         return_polar : bool, optional
             If True, returns the polar representation instead of converting
             to Cartesian. Default is False.
+        return_torch : bool, optional
+            If True, returns a torch.Tensor on the device.
+            Otherwise returns numpy array. Default is False.
         order : int, optional
             Interpolation order for polar to cartesian conversion (0-5).
             Default is 5.
@@ -319,7 +364,7 @@ class PolarProjectionDecomposer:
 
         Returns
         -------
-        np.ndarray
+        np.ndarray | torch.Tensor
             Reconstructed projection (complex-valued).
             Shape is (num_angle, num_radius) if return_polar is True,
             otherwise output_shape.
@@ -353,7 +398,7 @@ class PolarProjectionDecomposer:
             device=self.device, dtype=torch.complex64
         )
         singular_values = torch.from_numpy(result.singular_values).to(
-            device=self.device, dtype=torch.complex64
+            device=self.device, dtype=torch.float32
         )
         right_singular_vectors = torch.from_numpy(result.right_singular_vectors).to(
             device=self.device, dtype=torch.complex64
@@ -382,29 +427,35 @@ class PolarProjectionDecomposer:
                 contribution = u_ki * s_k * radial_component
                 polar_projection += torch.outer(angular_component, contribution)
 
-        # Convert back to numpy
-        polar_projection_np = polar_projection.cpu().numpy()
-
         if return_polar:
-            return polar_projection_np
+            if return_torch:
+                return polar_projection
+            return polar_projection.cpu().numpy()
 
         # Convert to Cartesian space using cached transform
         if output_shape is not None:
             # Need to create a new transform if output shape differs
+            transform_device = "cuda" if self.device.type == "cuda" else "numpy"
             temp_transform = OffsetPolarTransform.from_image(
                 image_shape=output_shape,
                 num_angle=result.num_angular_components,
                 num_radius=result.num_radial_components,
+                device=transform_device,
             )
             cartesian_projection = temp_transform.to_cartesian(
-                polar_projection_np, order=order, mode=mode
+                polar_projection, order=order, mode=mode
             )
         else:
             # Use cached transform
             cartesian_projection = self.polar_transform.to_cartesian(
-                polar_projection_np, order=order, mode=mode
+                polar_projection, order=order, mode=mode
             )
 
+        if return_torch:
+            return cartesian_projection
+        # Convert to numpy if on GPU
+        if isinstance(cartesian_projection, torch.Tensor):
+            return cartesian_projection.cpu().numpy()
         return cartesian_projection
 
     def construct_cartesian_feature(
@@ -412,9 +463,10 @@ class PolarProjectionDecomposer:
         k_idx: int,
         eig_idx: int,
         output_shape: tuple[int, int] | None = None,
+        return_torch: bool = False,
         order: int = 5,
         mode: str = "symmetric",
-    ) -> np.ndarray:
+    ) -> np.ndarray | torch.Tensor:
         """Construct a single Cartesian feature for an angular frequency and eigenvalue.
 
         Uses the offset polar coordinate system for better spatial coverage when
@@ -429,6 +481,9 @@ class PolarProjectionDecomposer:
         output_shape : tuple[int, int] | None, optional
             Shape of the output Cartesian image. If None, uses the volume's
             spatial dimensions. Default is None.
+        return_torch : bool, optional
+            If True, returns a torch.Tensor on the device.
+            Otherwise returns numpy array. Default is False.
         order : int, optional
             Interpolation order for polar to cartesian conversion (0-5).
             Default is 5.
@@ -438,24 +493,26 @@ class PolarProjectionDecomposer:
 
         Returns
         -------
-        np.ndarray
-            A complex np.ndarray for the feature in Cartesian space.
+        np.ndarray | torch.Tensor
+            A complex array for the feature in Cartesian space.
 
         Raises
         ------
         ValueError
             If decomposition has not been performed yet.
         """
-        polar_feature = self.construct_polar_feature(k_idx, eig_idx)
+        polar_feature = self.construct_polar_feature(k_idx, eig_idx, return_torch=True)
 
         # Convert to cartesian using cached transform
         if output_shape is not None:
             # Need to create a new transform if output shape differs
             result = self.result
+            transform_device = "cuda" if self.device.type == "cuda" else "numpy"
             temp_transform = OffsetPolarTransform.from_image(
                 image_shape=output_shape,
                 num_angle=result.num_angular_components,
                 num_radius=result.num_radial_components,
+                device=transform_device,
             )
             cartesian_feature = temp_transform.to_cartesian(
                 polar_feature, order=order, mode=mode
@@ -466,6 +523,11 @@ class PolarProjectionDecomposer:
                 polar_feature, order=order, mode=mode
             )
 
+        if return_torch:
+            return cartesian_feature
+        # Convert to numpy if on GPU
+        if isinstance(cartesian_feature, torch.Tensor):
+            return cartesian_feature.cpu().numpy()
         return cartesian_feature
 
     def save_result(self, path: str | Path) -> None:
@@ -495,9 +557,9 @@ class PolarProjectionDecomposer:
     def from_result(
         cls,
         result: DecompositionResult | str | Path,
-        volume: np.ndarray,
-        phi_values: np.ndarray | None = None,
-        theta_values: np.ndarray | None = None,
+        volume: np.ndarray | torch.Tensor,
+        phi_values: np.ndarray | torch.Tensor | None = None,
+        theta_values: np.ndarray | torch.Tensor | None = None,
         device: str | torch.device = "cpu",
     ) -> "PolarProjectionDecomposer":
         """Create a decomposer with a pre-computed result.
@@ -509,11 +571,11 @@ class PolarProjectionDecomposer:
         ----------
         result : DecompositionResult | str | Path
             A DecompositionResult instance or path to a saved result.
-        volume : np.ndarray
+        volume : np.ndarray | torch.Tensor
             The volume (needed for Cartesian feature construction).
-        phi_values : np.ndarray | None, optional
+        phi_values : np.ndarray | torch.Tensor | None, optional
             Azimuthal angles. Can be None if only constructing features.
-        theta_values : np.ndarray | None, optional
+        theta_values : np.ndarray | torch.Tensor | None, optional
             Polar angles. Can be None if only constructing features.
         device : str | torch.device, optional
             Device to use for computation. Default is 'cpu'.
@@ -526,11 +588,13 @@ class PolarProjectionDecomposer:
         if isinstance(result, (str, Path)):
             result = DecompositionResult.load(result)
 
+        device_obj = torch.device(device)
+
         # Create dummy arrays if not provided
         if phi_values is None:
-            phi_values = np.zeros(result.num_orientations)
+            phi_values = torch.zeros(result.num_orientations, device=device_obj)
         if theta_values is None:
-            theta_values = np.zeros(result.num_orientations)
+            theta_values = torch.zeros(result.num_orientations, device=device_obj)
 
         instance = cls(
             volume,
@@ -538,15 +602,19 @@ class PolarProjectionDecomposer:
             theta_values,
             num_radius=result.num_radial_components,
             num_angle=result.num_angular_components,
-            device=device,
+            device=device_obj,
         )
         instance._result = result
 
+        # Determine device string for OffsetPolarTransform
+        transform_device = "cuda" if device_obj.type == "cuda" else "numpy"
+
         # Create the polar transform
         instance._polar_transform = OffsetPolarTransform.from_image(
-            image_shape=(volume.shape[-2], volume.shape[-1]),
+            image_shape=(instance.volume.shape[-2], instance.volume.shape[-1]),
             num_angle=result.num_angular_components,
             num_radius=result.num_radial_components,
+            device=transform_device,
         )
 
         return instance
