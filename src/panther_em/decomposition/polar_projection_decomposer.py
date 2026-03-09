@@ -10,6 +10,8 @@ from panther_em.decomposition.result import DecompositionResult
 from panther_em.utils import get_polar_projections_from_volume
 from panther_em.utils.warp_transforms import OffsetPolarTransform
 
+from .pipeline_projections import do_pipelined_projection_and_transforms
+
 # TODO: Large numbers of projections (orientations) and high polar resolutions
 # (number of angular and radial components) can lead to OOM errors on GPUs. Need to
 # implements a batched way to handle portions of the data at a time handing off
@@ -78,19 +80,18 @@ class PolarProjectionDecomposer:
 
         # Convert inputs to tensors on the correct device
         if isinstance(volume, np.ndarray):
-            self.volume = torch.from_numpy(volume).to(self.device)
-        else:
-            self.volume = volume.to(self.device)
+            volume = torch.from_numpy(volume.copy())
 
         if isinstance(phi_values, np.ndarray):
-            self.phi_values = torch.from_numpy(phi_values).to(self.device)
-        else:
-            self.phi_values = phi_values.to(self.device)
+            phi_values = torch.from_numpy(phi_values.copy())
 
         if isinstance(theta_values, np.ndarray):
-            self.theta_values = torch.from_numpy(theta_values).to(self.device)
-        else:
-            self.theta_values = theta_values.to(self.device)
+            theta_values = torch.from_numpy(theta_values.copy())
+
+        # Send to the target device
+        self.volume = volume.to(self.device)
+        self.phi_values = phi_values.to(self.device)
+        self.theta_values = theta_values.to(self.device)
 
         self.num_radius = num_radius
         self.num_angle = num_angle
@@ -143,97 +144,130 @@ class PolarProjectionDecomposer:
             )
         return self._polar_transform
 
-    def do_decomposition(self, k_max: int | None = None) -> DecompositionResult:
+    def do_decomposition(
+        self,
+        k_max: int | None = None,
+        projection_batch_size: int = 128,
+        block_batch_size: int = 32,
+    ) -> DecompositionResult:
         """Run the block-circulant decomposition using the held orientations.
 
         Generates polar projections on-the-fly and performs eigendecomposition
         on each angular frequency block.
+
+        NOTE: Computation is split into two stages: 1) on-the-fly projection generation
+        plus FFT transformation 2) block-wise SVD decomposition. A barrier exists
+        between these two stages.
 
         Parameters
         ----------
         k_max : int | None, optional
             Maximum angular frequency index to compute. If None, uses all
             angular components. Default is None.
+        projection_batch_size : int, optional
+            Number of projections to process at a time for memory efficiency.
+            Default is 128.
+        block_batch_size : int, optional
+            Number of frequency blocks to process at a time on GPU for SVD.
+            Default is 32.
 
         Returns
         -------
         DecompositionResult
             The decomposition result containing singular values and vectors.
         """
-        # Generate projections on-the-fly (memory efficient)
-        # This will use GPU if inputs are on GPU
-        projections_polar = get_polar_projections_from_volume(
+        # Stage 1: GPU projection generation and transform. Results are generally too
+        # large to fit in GPU memory, so stored on CPU memory.
+        polar_projections_transformed_cpu = do_pipelined_projection_and_transforms(
             volume=self.volume,
             phi=self.phi_values,
             theta=self.theta_values,
-            psi=0.0,
+            psi=torch.zeros_like(self.phi_values),
+            fourier_filters=None,  # TODO: Include computation for the defocus offsets
             num_angle=self.num_angle,
             num_radius=self.num_radius,
-        )
-        num_orients, num_angle, num_radius = projections_polar.shape
-
-        # Determine device string for OffsetPolarTransform
-        transform_device = "cuda" if self.device.type == "cuda" else "numpy"
-
-        # Create the polar transform for later use in reconstruction
-        self._polar_transform = OffsetPolarTransform.from_image(
-            image_shape=(self.volume.shape[-2], self.volume.shape[-1]),
-            num_angle=num_angle,
-            num_radius=num_radius,
-            device=transform_device,
+            warp_polar_kwargs={},
+            projection_batch_size=projection_batch_size,
         )
 
-        # Ensure projections are complex and on correct device
-        if not projections_polar.is_complex():
-            projections_polar = projections_polar.to(dtype=torch.complex64)
-        projections_polar = projections_polar.to(self.device)
-
-        # FFT along angular dimension
-        projections_fft = torch.fft.fft(projections_polar, dim=1)
+        # Stage 2: Decompose each frequency block with SVD
+        # Collapse defocus dimension into orientations for SVD:
+        # (num_defocus, num_orients, num_angle, num_radius) ->
+        # (num_defocus * num_orients, num_angle, num_radius)
+        num_defocus, num_orients, num_angle, num_radius = (
+            polar_projections_transformed_cpu.shape
+        )
+        polar_projections_transformed_cpu = (
+            polar_projections_transformed_cpu.reshape(
+                num_defocus * num_orients, num_angle, num_radius
+            )
+        )
+        num_rows = num_defocus * num_orients  # combined orientation dimension
 
         # Determine k_max
         if k_max is None:
             k_max = num_angle
 
-        # Iterate over all angular frequency components and store the SVD results
+        # Pre-compute radial scaling vector once
+        r = torch.arange(num_radius, device=self.device, dtype=torch.float32)
+        r = r / num_radius
+
+        # Allocate tensors for the SVD results on CPU
         singular_values = torch.zeros(
-            (k_max, num_radius), dtype=torch.float32, device=self.device
+            (k_max, num_radius), dtype=torch.float32, device="cpu"
         )
         left_singular_vectors = torch.zeros(
-            (k_max, num_orients, num_radius),
+            (k_max, num_rows, num_radius),
             dtype=torch.complex64,
-            device=self.device,
+            device="cpu",
         )
         right_singular_vectors = torch.zeros(
             (k_max, num_radius, num_radius),
             dtype=torch.complex64,
-            device=self.device,
+            device="cpu",
         )
 
-        for k in tqdm.tqdm(range(k_max), desc="decomp freq blocks"):
-            freq_block = projections_fft[:, k, :]
+        # Stage 2: Loop over frequency blocks in batches for SVD decomposition
+        for k_start in tqdm.tqdm(
+            range(0, k_max, block_batch_size), desc="decomp freq blocks"
+        ):
+            k_end = min(k_start + block_batch_size, k_max)
 
-            # Scale by the radial component (proper integration term $r dr$)
-            r = torch.arange(num_radius, device=self.device, dtype=torch.float32)
-            r = r / num_radius
-            freq_block_scaled = freq_block * r[None, :]
+            for k in range(k_start, k_end):
+                # Extract frequency block: (num_rows, num_radius)
+                freq_block = polar_projections_transformed_cpu[:, k, :]
+                freq_block = freq_block.to(device=self.device, non_blocking=True)
 
-            # Call SVD on the scaled frequency block
-            u, s, vh = torch.linalg.svd(freq_block_scaled, full_matrices=False)
+                # Scale by the radial component (proper integration term r dr)
+                freq_block_scaled = freq_block * r[None, :]
 
-            singular_values[k] = s
-            left_singular_vectors[k] = u
-            right_singular_vectors[k] = vh.conj().T
+                # Call SVD on the scaled frequency block
+                u, s, vh = torch.linalg.svd(freq_block_scaled, full_matrices=False)
+
+                singular_values[k] = s.cpu()
+                left_singular_vectors[k] = u.cpu()
+                # Store V (columns of right singular vectors), not Vh
+                right_singular_vectors[k] = vh.mH.cpu()
+
+                del freq_block, freq_block_scaled, u, s, vh
 
         # Convert results back to numpy for storage
         self._result = DecompositionResult(
             singular_values=singular_values.cpu().numpy().astype(np.float32),
             left_singular_vectors=left_singular_vectors.cpu().numpy(),
             right_singular_vectors=right_singular_vectors.cpu().numpy(),
-            num_orientations=num_orients,
+            num_orientations=num_rows,
             num_angular_components=num_angle,
             num_radial_components=num_radius,
             k_max=k_max,
+        )
+        
+        # Create the polar transform for later use in reconstruction
+        self._polar_transform = OffsetPolarTransform.from_image(
+            image_shape=(self.volume.shape[-2], self.volume.shape[-1]),
+            num_angle=num_angle,
+            num_radius=num_radius,
+            device="cuda" if self.device.type == "cuda" else "numpy",
         )
 
         return self._result
