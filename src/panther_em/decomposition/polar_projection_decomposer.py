@@ -148,7 +148,7 @@ class PolarProjectionDecomposer:
         self,
         k_max: int | None = None,
         projection_batch_size: int = 128,
-        block_batch_size: int = 32,
+        block_batch_size: int = 8,
     ) -> DecompositionResult:
         """Run the block-circulant decomposition using the held orientations.
 
@@ -169,7 +169,7 @@ class PolarProjectionDecomposer:
             Default is 128.
         block_batch_size : int, optional
             Number of frequency blocks to process at a time on GPU for SVD.
-            Default is 32.
+            Default is 8.
 
         Returns
         -------

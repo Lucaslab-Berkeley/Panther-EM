@@ -22,26 +22,124 @@ steps.
 import tqdm
 import roma
 import torch
+import torch.nn.functional as F
 from torch_fourier_slice import project_3d_to_2d
+from torch_fourier_slice.slice_extraction import extract_central_slices_rfft_3d
+from torch_fourier_slice.volume_utils import compute_cube_face_averages
 
 from panther_em.utils.warp_transforms import warp_offset_polar
 
 
+def precompute_volume_dft(
+    volume: torch.Tensor,
+    pad_factor: float = 2.0,
+) -> tuple[torch.Tensor, float, int]:
+    """Precompute the 3D RFFT of a volume with padding.
+
+    Parameters
+    ----------
+    volume : torch.Tensor
+        `(d, d, d)` cubic volume.
+    pad_factor : float
+        Padding factor for the volume. Default is 2.0.
+
+    Returns
+    -------
+    dft : torch.Tensor
+        The fftshifted 3D RFFT of the padded volume, with DC zeroed out.
+    volume_mean_scaled : float
+        `volume.mean() * d`, the constant to add back to projections after IFFT.
+    pad_width : int
+        Number of pixels padded on each side (0 if pad_factor <= 1.0).
+    """
+    d = volume.shape[-1]
+
+    pad_width = 0
+    if pad_factor > 1.0:
+        pad_width = int((d * (pad_factor - 1.0)) // 2)
+        edge_value = compute_cube_face_averages(volume, n=4)
+        volume = F.pad(volume, pad=[pad_width] * 6, mode="constant", value=edge_value)
+
+    volume_mean_scaled = volume.mean() * d
+
+    # Center-to-origin shift, then 3D RFFT
+    dft = torch.fft.fftshift(volume, dim=(-3, -2, -1))
+    dft = torch.fft.rfftn(dft, dim=(-3, -2, -1))
+    dft[..., 0, 0, 0] = 0.0  # zero DC to avoid low-res artifacts
+    dft = torch.fft.fftshift(dft, dim=(-3, -2))  # shift so DC is at center
+
+    return dft, volume_mean_scaled, pad_width
+
+
+def project_from_precomputed_dft(
+    dft: torch.Tensor,
+    rotation_matrices: torch.Tensor,
+    volume_mean_scaled: float,
+    pad_width: int,
+    fftfreq_max: float | None = 0.5,
+    zyx_matrices: bool = False,
+) -> torch.Tensor:
+    """Extract central slices from a precomputed DFT and transform to real space.
+
+    Parameters
+    ----------
+    dft : torch.Tensor
+        Precomputed fftshifted 3D RFFT from `precompute_volume_dft`.
+    rotation_matrices : torch.Tensor
+        `(..., 3, 3)` rotation matrices for slice extraction.
+    volume_mean_scaled : float
+        Constant to add back after IFFT (volume_mean * d).
+    pad_width : int
+        Padding width to remove from projections.
+    fftfreq_max : float | None
+        Maximum frequency in cycles per pixel. Default is 0.5.
+    zyx_matrices : bool
+        Whether matrices operate on zyx coordinates. Default is False.
+
+    Returns
+    -------
+    projections : torch.Tensor
+        `(..., d, d)` real-space projections.
+    """
+    projections = extract_central_slices_rfft_3d(
+        volume_rfft=dft,
+        rotation_matrices=rotation_matrices,
+        fftfreq_max=fftfreq_max,
+        zyx_matrices=zyx_matrices,
+    )
+
+    # Transform back to real space
+    projections = torch.fft.ifftshift(projections, dim=(-2,))
+    projections = torch.fft.irfftn(projections, dim=(-2, -1))
+    projections = torch.fft.ifftshift(projections, dim=(-2, -1))
+
+    # Unpad
+    if pad_width > 0:
+        projections = F.pad(projections, pad=[-pad_width] * 4)
+
+    # Add back the mean
+    projections += volume_mean_scaled
+
+    return projections
+
+
 def generate_projection_batch(
-    volume: torch.Tensor,  # (d, h, w)
+    dft: torch.Tensor,
+    volume_mean_scaled: float,
+    pad_width: int,
     phi: torch.Tensor,  # (B,)
     theta: torch.Tensor,  # (B,)
     psi: torch.Tensor,  # (B,)
-    pad_factor: float = 2.0,
     fftfreq_max: float = 0.5,
 ) -> torch.Tensor:  # (B, h, w)
-    """Generate a batch of 2D projections from a 3D volume."""
+    """Generate a batch of 2D projections from a precomputed volume DFT."""
     rot_matrix = roma.euler_to_rotmat("ZYZ", angles=(phi, theta, psi), degrees=True)
 
-    return project_3d_to_2d(
-        volume=volume,
+    return project_from_precomputed_dft(
+        dft=dft,
         rotation_matrices=rot_matrix,
-        pad_factor=pad_factor,
+        volume_mean_scaled=volume_mean_scaled,
+        pad_width=pad_width,
         fftfreq_max=fftfreq_max,
     )
 
@@ -58,7 +156,9 @@ def apply_fourier_filters(
 
 
 def process_batch(
-    volume: torch.Tensor,
+    dft: torch.Tensor,
+    volume_mean_scaled: float,
+    pad_width: int,
     phi: torch.Tensor,
     theta: torch.Tensor,
     psi: torch.Tensor,
@@ -66,13 +166,17 @@ def process_batch(
     num_angle: int,
     num_radius: int,
     warp_polar_kwargs: dict,
+    fftfreq_max: float = 0.5,
 ) -> torch.Tensor:
-    """Generate a batch of polar projections from a 3D volume, FFT along angular dim."""
+    """Generate a batch of polar projections from a precomputed DFT, FFT along angular dim."""
     projections = generate_projection_batch(
-        volume=volume,
+        dft=dft,
+        volume_mean_scaled=volume_mean_scaled,
+        pad_width=pad_width,
         phi=phi,
         theta=theta,
         psi=psi,
+        fftfreq_max=fftfreq_max,
     )
 
     projections_filtered = apply_fourier_filters(projections, fourier_filters)
@@ -83,6 +187,8 @@ def process_batch(
 
     # warp_offset_polar expects only a single batch dimension, but have two batch dims.
     # Create a temporary view to combine batch dimensions
+    num_defocus = fourier_filters.shape[0]
+    batch_size = phi.shape[0]
     projections_filtered_view = projections_filtered.view(
         -1,
         projections_filtered.shape[-2],
@@ -98,7 +204,15 @@ def process_batch(
         **warp_polar_kwargs,
     )
 
-    return torch.fft.fft(projections_polar, dim=-2)
+    # FFT along angular dimension, then restore defocus batch shape
+    projections_polar_fft = torch.fft.fft(projections_polar, dim=-2)
+
+    # Reshape back to (num_defocus, batch_size, num_angle, num_radius)
+    projections_polar_fft = projections_polar_fft.view(
+        num_defocus, batch_size, num_angle, num_radius
+    )
+
+    return projections_polar_fft
 
 
 def do_pipelined_projection_and_transforms(
@@ -111,15 +225,55 @@ def do_pipelined_projection_and_transforms(
     num_radius: int,
     warp_polar_kwargs: dict,
     projection_batch_size: int = 128,
+    pad_factor: float = 2.0,
+    fftfreq_max: float = 0.5,
     show_progress: bool = True,
 ) -> torch.Tensor:
-    """Pipelined generation and transforms of projections in polar coordinates."""
+    """Pipelined generation and transforms of projections in polar coordinates.
+
+    Parameters
+    ----------
+    volume : torch.Tensor
+        `(d, d, d)` cubic volume on GPU.
+    phi, theta, psi : torch.Tensor
+        `(N,)` Euler angles in degrees.
+    fourier_filters : torch.Tensor | None
+        `(f, h, w // 2 + 1)` Fourier-space filters, or None for identity.
+    num_angle : int
+        Number of angular samples in polar projection.
+    num_radius : int
+        Number of radial samples in polar projection.
+    warp_polar_kwargs : dict
+        Additional kwargs for `warp_offset_polar`.
+    projection_batch_size : int
+        Orientations per GPU batch. Default is 128.
+    pad_factor : float
+        Volume padding factor for Fourier slicing. Default is 2.0.
+    fftfreq_max : float
+        Maximum frequency in cycles per pixel. Default is 0.5.
+    show_progress : bool
+        Whether to show a tqdm progress bar. Default is True.
+
+    Returns
+    -------
+    torch.Tensor
+        `(num_defocus, num_projections, num_angle, num_radius)` complex64 tensor
+        on CPU (pinned memory).
+    """
     if fourier_filters is None:
         fourier_filters = torch.ones(
             (1, volume.shape[1], volume.shape[2] // 2 + 1),
             device=volume.device,
             dtype=torch.complex64,
         )
+
+    # Precompute the 3D RFFT once — stays on GPU for the entire pipeline
+    dft, volume_mean_scaled, pad_width = precompute_volume_dft(
+        volume, pad_factor=pad_factor
+    )
+
+    # Free the original volume from GPU since we only need the DFT now
+    del volume
 
     # Allocate memory on CPU for full storage
     num_projections = phi.shape[0]
@@ -130,7 +284,7 @@ def do_pipelined_projection_and_transforms(
         device="cpu",
         pin_memory=True,
     )
-    
+
     range_obj = range(0, num_projections, projection_batch_size)
     if show_progress:
         range_obj = tqdm.tqdm(
@@ -145,29 +299,35 @@ def do_pipelined_projection_and_transforms(
         s = slice(start_idx, end_idx)
         batch_size = end_idx - start_idx
 
-        batch_phi = phi[s]
-        batch_theta = theta[s]
-        batch_psi = psi[s]
-
         projections_polar_fft = process_batch(
-            volume=volume,
-            phi=batch_phi,
-            theta=batch_theta,
-            psi=batch_psi,
+            dft=dft,
+            volume_mean_scaled=volume_mean_scaled,
+            pad_width=pad_width,
+            phi=phi[s],
+            theta=theta[s],
+            psi=psi[s],
             fourier_filters=fourier_filters,
             num_angle=num_angle,
             num_radius=num_radius,
             warp_polar_kwargs=warp_polar_kwargs,
+            fftfreq_max=fftfreq_max,
         )
 
-        polar_projections_transformed_cpu[:, s] = projections_polar_fft.cpu()
+        # Copy to CPU pinned memory (async for overlap with next batch compute)
+        polar_projections_transformed_cpu[:, s].copy_(
+            projections_polar_fft, non_blocking=True
+        )
+        del projections_polar_fft
 
-        # Update progress bar by actual batch size (tqdm auto-increments by 1)
-        if show_progress and end_idx < num_projections:
-            range_obj.update(batch_size - 1)
+        # Update progress bar by actual batch size (iteration auto-increments by 1)
+        if show_progress:
+            remaining = num_projections - end_idx
+            range_obj.update(batch_size - 1 if remaining > 0 else remaining + 1)
 
     # Ensure all async copies are complete before returning
-    if volume.is_cuda:
-        torch.cuda.synchronize(volume.device)
+    if dft.is_cuda:
+        torch.cuda.synchronize(dft.device)
+
+    del dft
 
     return polar_projections_transformed_cpu
