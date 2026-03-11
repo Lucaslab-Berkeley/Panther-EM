@@ -7,7 +7,6 @@ import torch
 import tqdm
 
 from panther_em.decomposition.result import DecompositionResult
-from panther_em.utils import get_polar_projections_from_volume
 from panther_em.utils.warp_transforms import OffsetPolarTransform
 
 from .pipeline_projections import do_pipelined_projection_and_transforms
@@ -197,10 +196,8 @@ class PolarProjectionDecomposer:
         num_defocus, num_orients, num_angle, num_radius = (
             polar_projections_transformed_cpu.shape
         )
-        polar_projections_transformed_cpu = (
-            polar_projections_transformed_cpu.reshape(
-                num_defocus * num_orients, num_angle, num_radius
-            )
+        polar_projections_transformed_cpu = polar_projections_transformed_cpu.reshape(
+            num_defocus * num_orients, num_angle, num_radius
         )
         num_rows = num_defocus * num_orients  # combined orientation dimension
 
@@ -261,7 +258,7 @@ class PolarProjectionDecomposer:
             num_radial_components=num_radius,
             k_max=k_max,
         )
-        
+
         # Create the polar transform for later use in reconstruction
         self._polar_transform = OffsetPolarTransform.from_image(
             image_shape=(self.volume.shape[-2], self.volume.shape[-1]),
@@ -474,7 +471,7 @@ class PolarProjectionDecomposer:
                 image_shape=output_shape,
                 num_angle=result.num_angular_components,
                 num_radius=result.num_radial_components,
-                device=transform_device,
+                device=transform_device,  # type: ignore
             )
             cartesian_projection = temp_transform.to_cartesian(
                 polar_projection, order=order, mode=mode
@@ -546,7 +543,7 @@ class PolarProjectionDecomposer:
                 image_shape=output_shape,
                 num_angle=result.num_angular_components,
                 num_radius=result.num_radial_components,
-                device=transform_device,
+                device=transform_device,  # type: ignore
             )
             cartesian_feature = temp_transform.to_cartesian(
                 polar_feature, order=order, mode=mode
@@ -648,7 +645,7 @@ class PolarProjectionDecomposer:
             image_shape=(instance.volume.shape[-2], instance.volume.shape[-1]),
             num_angle=result.num_angular_components,
             num_radius=result.num_radial_components,
-            device=transform_device,
+            device=transform_device,  # type: ignore
         )
 
         return instance

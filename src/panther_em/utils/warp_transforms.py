@@ -90,7 +90,7 @@ def warp_offset_polar(
 
     # Obtain the transformer from the cache and call the to_offset_polar method
     transformer = _TRANSFORMER_CACHE[key]
-    return transformer.to_offset_polar(image, **kwargs)
+    return transformer.to_offset_polar(image, **kwargs)  # type: ignore
 
 
 def warp_offset_polar_inverse(
@@ -144,7 +144,7 @@ def warp_offset_polar_inverse(
         )
 
     transformer = _TRANSFORMER_CACHE[key]
-    return transformer.to_cartesian(image, **kwargs)
+    return transformer.to_cartesian(image, **kwargs)  # type: ignore
 
 
 class OffsetPolarTransform:

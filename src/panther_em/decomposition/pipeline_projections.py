@@ -19,11 +19,10 @@ steps.
 7. Move batch of Fourier-space polar projections back to CPU and store for SVD step.
 """
 
-import tqdm
 import roma
 import torch
 import torch.nn.functional as F
-from torch_fourier_slice import project_3d_to_2d
+import tqdm
 from torch_fourier_slice.slice_extraction import extract_central_slices_rfft_3d
 from torch_fourier_slice.volume_utils import compute_cube_face_averages
 
@@ -168,7 +167,7 @@ def process_batch(
     warp_polar_kwargs: dict,
     fftfreq_max: float = 0.5,
 ) -> torch.Tensor:
-    """Generate a batch of polar projections from a precomputed DFT, FFT along angular dim."""
+    """Generate a batch of polar proj. from a DFT, FFT along angular dim."""
     projections = generate_projection_batch(
         dft=dft,
         volume_mean_scaled=volume_mean_scaled,
@@ -285,16 +284,15 @@ def do_pipelined_projection_and_transforms(
         pin_memory=True,
     )
 
-    range_obj = range(0, num_projections, projection_batch_size)
+    pbar = None
     if show_progress:
-        range_obj = tqdm.tqdm(
-            range_obj,
+        pbar = tqdm.tqdm(
+            total=num_projections,
             desc="calc. projections",
             unit="proj",
-            total=num_projections,
         )
 
-    for start_idx in range_obj:
+    for start_idx in range(0, num_projections, projection_batch_size):
         end_idx = min(start_idx + projection_batch_size, num_projections)
         s = slice(start_idx, end_idx)
         batch_size = end_idx - start_idx
@@ -319,10 +317,11 @@ def do_pipelined_projection_and_transforms(
         )
         del projections_polar_fft
 
-        # Update progress bar by actual batch size (iteration auto-increments by 1)
-        if show_progress:
-            remaining = num_projections - end_idx
-            range_obj.update(batch_size - 1 if remaining > 0 else remaining + 1)
+        if pbar is not None:
+            pbar.update(batch_size)
+
+    if pbar is not None:
+        pbar.close()
 
     # Ensure all async copies are complete before returning
     if dft.is_cuda:
