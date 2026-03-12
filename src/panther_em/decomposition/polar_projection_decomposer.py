@@ -71,6 +71,7 @@ class PolarProjectionDecomposer:
         phi_values: np.ndarray | torch.Tensor,
         theta_values: np.ndarray | torch.Tensor,
         num_radius: int,
+        fourier_filters: np.ndarray | torch.Tensor | None = None,
         num_angle: int = 360,
         device: str | torch.device = "cpu",
     ) -> None:
@@ -91,6 +92,9 @@ class PolarProjectionDecomposer:
         self.volume = volume.to(self.device)
         self.phi_values = phi_values.to(self.device)
         self.theta_values = theta_values.to(self.device)
+        self.fourier_filters = (
+            fourier_filters.to(self.device) if fourier_filters is not None else None
+        )
 
         self.num_radius = num_radius
         self.num_angle = num_angle
@@ -182,7 +186,7 @@ class PolarProjectionDecomposer:
             phi=self.phi_values,
             theta=self.theta_values,
             psi=torch.zeros_like(self.phi_values),
-            fourier_filters=None,  # TODO: Include computation for the defocus offsets
+            fourier_filters=self.fourier_filters,
             num_angle=self.num_angle,
             num_radius=self.num_radius,
             warp_polar_kwargs={},
