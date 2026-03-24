@@ -1,10 +1,13 @@
 """Dataclass for storing decomposition results."""
 
+from typing import Any
+
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import matplotlib.pyplot as plt
 
 
 @dataclass
@@ -66,7 +69,7 @@ class DecompositionResult:
                 f"right_singular_vectors shape {self.right_singular_vectors.shape} "
                 f"does not match expected {expected_vec_shape}"
             )
-            
+
     def __repr__(self) -> str:
         """String representation of the DecompositionResult."""
         return (
@@ -93,6 +96,7 @@ class DecompositionResult:
         np.savez_compressed(
             path,
             singular_values=self.singular_values,
+            left_singular_vectors=self.left_singular_vectors,
             right_singular_vectors=self.right_singular_vectors,
             num_orientations=self.num_orientations,
             num_angular_components=self.num_angular_components,
@@ -162,3 +166,90 @@ class DecompositionResult:
             The radial eigenvector with shape (num_radial_components,).
         """
         return self.right_singular_vectors[k_idx, :, eig_idx]
+
+    def scree_plot(
+        self, k_idx: int | None = None, **kwargs: dict[str, Any]
+    ) -> tuple[plt.Figure, plt.Axes]:
+        """Helper function for plotting sorted singular values vs index.
+
+        Parameters
+        ----------
+        k_idx : int | None, optional
+            If specified, plot singular values for this specific angular frequency
+            index. If None, plot all singular values across all k indices, sorted by
+            decreasing magnitude. Default is None.
+        **kwargs : dict[str, Any]
+            Additional keyword arguments to pass to plt.subplots()
+
+        Returns
+        -------
+        plt.Figure, plt.Axes
+            The matplotlib figure object and axes containing the scree plot.
+        """
+        fig, ax = plt.subplots(**kwargs)
+
+        if k_idx is not None:
+            svs = self.singular_values[k_idx, :]
+            title = f"Scree Plot for k={k_idx}"
+        else:
+            svs = self.singular_values.flatten()
+            title = "Scree Plot for All Singular Values"
+
+        sorted_indices = np.argsort(np.abs(svs))[::-1]
+        sorted_svs = svs[sorted_indices]
+
+        ax.plot(sorted_svs)
+        ax.set_title(title)
+        ax.set_xlabel("Index (sorted by magnitude)")
+        ax.set_ylabel("Singular Value (magnitude)")
+
+        return fig, ax
+
+    def variance_explained_plot(
+        self,
+        k_idx: int | None = None,
+        inverted: bool = True,
+        **kwargs: dict[str, Any],
+    ) -> tuple[plt.Figure, plt.Axes]:
+        """Helper function for plotting cumulative variance explained.
+
+        Parameters
+        ----------
+        k_idx : int | None, optional
+            If specified, plot variance explained for this specific angular frequency
+            index. If None, plot for all singular values across all k indices.
+            Default is None.
+        inverted : bool, optional
+            If True, plot (1 - var exp) rather than (var exp). Default is True.
+        **kwargs : dict[str, Any]
+            Additional keyword arguments to pass to plt.subplots()
+
+        Returns
+        -------
+        plt.Figure, plt.Axes
+            The matplotlib figure object and axes containing the variance explained plot.
+        """
+        fig, ax = plt.subplots(**kwargs)
+
+        if k_idx is not None:
+            svs = self.singular_values[k_idx, :]
+            title = f"Cumulative Variance Explained for k={k_idx}"
+        else:
+            svs = self.singular_values.flatten()
+            title = "Cumulative Variance Explained for All Singular Values"
+
+        sorted_indices = np.argsort(np.abs(svs))[::-1]
+        sorted_svs = svs[sorted_indices]
+
+        denom = np.sum(np.abs(sorted_svs) ** 2)
+        variance_explained = np.cumsum(np.abs(sorted_svs) ** 2) / denom
+
+        if inverted:
+            variance_explained = 1 - variance_explained
+
+        ax.plot(variance_explained)
+        ax.set_title(title)
+        ax.set_xlabel("Number of Components")
+        ax.set_ylabel("Cumulative Variance Explained")
+
+        return fig, ax
