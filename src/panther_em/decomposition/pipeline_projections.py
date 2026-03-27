@@ -26,7 +26,7 @@ import tqdm
 from torch_fourier_slice.slice_extraction import extract_central_slices_rfft_3d
 from torch_fourier_slice.volume_utils import compute_cube_face_averages
 
-from panther_em.utils.warp_transforms import warp_offset_polar
+from panther_em.utils.warp_transforms import OffsetPolarTransform
 
 
 def precompute_volume_dft(
@@ -162,8 +162,7 @@ def process_batch(
     theta: torch.Tensor,
     psi: torch.Tensor,
     fourier_filters: torch.Tensor,
-    num_angle: int,
-    num_radius: int,
+    transformer: OffsetPolarTransform,
     warp_polar_kwargs: dict,
     fftfreq_max: float = 0.5,
 ) -> torch.Tensor:
@@ -180,10 +179,6 @@ def process_batch(
 
     projections_filtered = apply_fourier_filters(projections, fourier_filters)
 
-    # Constants for the warp function
-    center = (projections_filtered.shape[-2] / 2, projections_filtered.shape[-2] / 2)
-    radius = projections_filtered.shape[-1] / 2  # Assuming square projections
-
     # warp_offset_polar expects only a single batch dimension, but have two batch dims.
     # Create a temporary view to combine batch dimensions
     num_defocus = fourier_filters.shape[0]
@@ -194,12 +189,8 @@ def process_batch(
         projections_filtered.shape[-1],
     )
 
-    projections_polar = warp_offset_polar(
+    projections_polar = transformer.to_offset_polar(
         projections_filtered_view,
-        num_angle=num_angle,
-        num_radius=num_radius,
-        center=center,
-        radius=radius,
         **warp_polar_kwargs,
     )
 
@@ -209,7 +200,7 @@ def process_batch(
 
     # Reshape back to (num_defocus, batch_size, num_angle, num_radius)
     projections_polar_fft = projections_polar_fft.view(
-        num_defocus, batch_size, num_angle, num_radius
+        num_defocus, batch_size, transformer.num_angle, transformer.num_radius
     )
 
     return projections_polar_fft
@@ -272,6 +263,15 @@ def do_pipelined_projection_and_transforms(
         volume, pad_factor=pad_factor
     )
 
+    # Initialize the coordinate transformer to use across batches
+    transform_device = "cuda" if volume.is_cuda else "numpy"
+    transformer = OffsetPolarTransform.from_image(
+        image_shape=(volume.shape[1], volume.shape[2]),
+        num_angle=num_angle,
+        num_radius=num_radius,
+        device=transform_device,  # type: ignore
+    )
+
     # Free the original volume from GPU since we only need the DFT now
     del volume
 
@@ -306,8 +306,7 @@ def do_pipelined_projection_and_transforms(
             theta=theta[s],
             psi=psi[s],
             fourier_filters=fourier_filters,
-            num_angle=num_angle,
-            num_radius=num_radius,
+            transformer=transformer,
             warp_polar_kwargs=warp_polar_kwargs,
             fftfreq_max=fftfreq_max,
         )

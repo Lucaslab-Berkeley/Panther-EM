@@ -189,7 +189,7 @@ class PolarProjectionDecomposer:
             fourier_filters=self.fourier_filters,
             num_angle=self.num_angle,
             num_radius=self.num_radius,
-            warp_polar_kwargs={},
+            warp_polar_kwargs={"preserve_energy": True},
             projection_batch_size=projection_batch_size,
         )
 
@@ -209,9 +209,9 @@ class PolarProjectionDecomposer:
         if k_max is None:
             k_max = num_angle
 
-        # Pre-compute radial scaling vector once
-        r = torch.arange(num_radius, device=self.device, dtype=torch.float32)
-        r = r / num_radius
+        # # Pre-compute radial scaling vector once
+        # r = torch.arange(num_radius, device=self.device, dtype=torch.float32)
+        # r = r / num_radius
 
         # Allocate tensors for the SVD results on CPU
         singular_values = torch.zeros(
@@ -239,18 +239,17 @@ class PolarProjectionDecomposer:
                 freq_block = polar_projections_transformed_cpu[:, k, :]
                 freq_block = freq_block.to(device=self.device, non_blocking=True)
 
-                # Scale by the radial component (proper integration term r dr)
-                freq_block_scaled = freq_block * r[None, :]
+                # # Scale by the radial component (proper integration term r dr)
+                # freq_block_scaled = freq_block * r[None, :]
 
-                # Call SVD on the scaled frequency block
-                u, s, vh = torch.linalg.svd(freq_block_scaled, full_matrices=False)
+                u, s, vh = torch.linalg.svd(freq_block, full_matrices=False)
 
                 singular_values[k] = s.cpu()
                 left_singular_vectors[k] = u.cpu()
                 # Store V (columns of right singular vectors), not Vh
                 right_singular_vectors[k] = vh.mH.cpu()
 
-                del freq_block, freq_block_scaled, u, s, vh
+                # del freq_block, u, s, vh
 
         # Convert results back to numpy for storage
         self._result = DecompositionResult(
@@ -298,28 +297,28 @@ class PolarProjectionDecomposer:
         )
         return torch.exp(1j * angles) / np.sqrt(result.num_angular_components)
 
-    def _undo_radial_scaling(self, radial_component: torch.Tensor) -> torch.Tensor:
-        """Undo the r scaling applied during decomposition.
+    # def _undo_radial_scaling(self, radial_component: torch.Tensor) -> torch.Tensor:
+    #     """Undo the r scaling applied during decomposition.
 
-        Parameters
-        ----------
-        radial_component : torch.Tensor
-            Radial component with shape (num_radius,).
+    #     Parameters
+    #     ----------
+    #     radial_component : torch.Tensor
+    #         Radial component with shape (num_radius,).
 
-        Returns
-        -------
-        torch.Tensor
-            Unscaled radial component.
-        """
-        result = self.result
-        r = (
-            torch.arange(
-                result.num_radial_components, device=self.device, dtype=torch.float32
-            )
-            / result.num_radial_components
-        )
-        # Avoid division by zero at r=0
-        return radial_component / torch.where(r > 0, r, torch.ones_like(r))
+    #     Returns
+    #     -------
+    #     torch.Tensor
+    #         Unscaled radial component.
+    #     """
+    #     result = self.result
+    #     r = (
+    #         torch.arange(
+    #             result.num_radial_components, device=self.device, dtype=torch.float32
+    #         )
+    #         / result.num_radial_components
+    #     )
+    #     # Avoid division by zero at r=0
+    #     return radial_component / torch.where(r > 0, r, torch.ones_like(r))
 
     def construct_polar_feature(
         self, k_idx: int, eig_idx: int, return_torch: bool = False
@@ -370,7 +369,8 @@ class PolarProjectionDecomposer:
         return_polar: bool = False,
         return_torch: bool = False,
         order: int = 5,
-        mode: str = "symmetric",
+        mode: str = "constant",
+        cval: float = 0.0,
     ) -> np.ndarray | torch.Tensor:
         """Reconstruct a Cartesian projection at a specific orientation.
 
@@ -395,7 +395,10 @@ class PolarProjectionDecomposer:
             Default is 5.
         mode : str, optional
             How to handle values outside boundaries during warping.
-            Default is "symmetric".
+            Default is "constant".
+        cval : float, optional
+            The constant value to use for padding when mode is "constant".
+            Default is 0.0.
 
         Returns
         -------
@@ -455,8 +458,9 @@ class PolarProjectionDecomposer:
                 # Right singular vector (radial component)
                 v_k = right_singular_vectors[k_idx, :, eig_idx]
 
-                # Undo the radial scaling applied during decomposition
-                radial_component = self._undo_radial_scaling(v_k)
+                # # Undo the radial scaling applied during decomposition
+                # radial_component = self._undo_radial_scaling(v_k)
+                radial_component = v_k
 
                 # Add contribution: u * s * v for this (k, eigenvalue) pair
                 contribution = u_ki * s_k * radial_component
@@ -500,7 +504,10 @@ class PolarProjectionDecomposer:
         output_shape: tuple[int, int] | None = None,
         return_torch: bool = False,
         order: int = 5,
-        mode: str = "symmetric",
+        mode: str = "constant",
+        cval: float = 0.0,
+        preserve_energy: bool = True,
+        wrap_angular_axis: bool = True,
     ) -> np.ndarray | torch.Tensor:
         """Construct a single Cartesian feature for an angular frequency and eigenvalue.
 
@@ -524,7 +531,15 @@ class PolarProjectionDecomposer:
             Default is 5.
         mode : str, optional
             How to handle values outside boundaries during warping.
-            Default is "symmetric".
+            Default is "constant".
+        cval : float, optional
+            Value to use for constant padding. Default is 0.0.
+        preserve_energy : bool, optional
+            Whether to apply a Jacobian correction to preserve energy between polar and
+            cartesian spaces. By default True.
+        wrap_angular_axis : bool, optional
+            Whether to apply wrap padding along the angular axis *only* for proper
+            interpolation across the 360-0 degree boundary. Default is True.
 
         Returns
         -------
@@ -550,12 +565,22 @@ class PolarProjectionDecomposer:
                 device=transform_device,  # type: ignore
             )
             cartesian_feature = temp_transform.to_cartesian(
-                polar_feature, order=order, mode=mode
+                polar_feature,
+                order=order,
+                mode=mode,
+                cval=cval,
+                preserve_energy=preserve_energy,
+                wrap_angular_axis=wrap_angular_axis,
             )
         else:
             # Use cached transform
             cartesian_feature = self.polar_transform.to_cartesian(
-                polar_feature, order=order, mode=mode
+                polar_feature,
+                order=order,
+                mode=mode,
+                cval=cval,
+                preserve_energy=preserve_energy,
+                wrap_angular_axis=wrap_angular_axis,
             )
 
         if return_torch:

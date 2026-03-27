@@ -48,7 +48,8 @@ def warp_numpy(
     coords: np.ndarray,
     output_shape: tuple[int, int],
     order: int = 5,
-    mode: str = "symmetric",
+    mode: str = "constant",
+    cval: float = 0.0,
     **kwargs: dict[Any, Any],
 ) -> np.ndarray:
     """Warp an image using scikit-image (CPU).
@@ -64,7 +65,9 @@ def warp_numpy(
     order : int, optional
         Order of interpolation (0-5), by default 5.
     mode : str, optional
-        How to handle values outside boundaries, by default "symmetric".
+        How to handle values outside boundaries, by default "constant".
+    cval : float, optional
+        The constant value to use for padding when mode is "constant", by default 0.0.
     **kwargs
         Additional arguments passed to skimage.transform.warp.
 
@@ -79,6 +82,7 @@ def warp_numpy(
         output_shape=output_shape,
         order=order,
         mode=mode,
+        cval=cval,
         **kwargs,
     )
 
@@ -93,7 +97,8 @@ def warp_torch_cuda(
     coords: torch.Tensor,
     output_shape: tuple[int, int],
     order: int = 5,
-    mode: str = "symmetric",
+    mode: str = "constant",
+    cval: float = 0.0,
     **kwargs: dict[Any, Any],
 ) -> torch.Tensor:
     """Warp an image using cuCIM on GPU (for PyTorch CUDA tensors).
@@ -113,7 +118,9 @@ def warp_torch_cuda(
     order : int, optional
         Order of interpolation (0-5), by default 5.
     mode : str, optional
-        How to handle values outside boundaries, by default "symmetric".
+        How to handle values outside boundaries, by default "constant".
+    cval : float, optional
+        The constant value to use for padding when mode is "constant", by default 0.0.
     **kwargs
         Additional arguments passed to cucim.skimage.transform.warp.
 
@@ -168,6 +175,7 @@ def warp_torch_cuda(
         output_shape=output_shape,
         order=order,
         mode=mode,
+        cval=cval,
         **kwargs,
     )
 
