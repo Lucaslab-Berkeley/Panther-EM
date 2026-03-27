@@ -203,8 +203,9 @@ def process_batch(
         **warp_polar_kwargs,
     )
 
-    # FFT along angular dimension, then restore defocus batch shape
-    projections_polar_fft = torch.fft.fft(projections_polar, dim=-2)
+    # FFT along angular dimension
+    # NOTE: Orthonormal transformation to preserve forward-backward scaling of features
+    projections_polar_fft = torch.fft.fft(projections_polar, dim=-2, norm="ortho")
 
     # Reshape back to (num_defocus, batch_size, num_angle, num_radius)
     projections_polar_fft = projections_polar_fft.view(
