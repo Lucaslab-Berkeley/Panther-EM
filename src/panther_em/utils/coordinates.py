@@ -3,6 +3,13 @@
 import numpy as np
 
 
+# NOTE: Offset polar grids have every other ring offset by (delta_theta / 2) to better
+#       sample 2D space (less dramatic angular gaps at larger radii). Parameter below
+#       controls application of offset or not (True - apply offset, False - no offset).
+#       For testing purposes.
+APPLY_ANGULAR_OFFSET = True
+
+
 def forward_cartesian_to_offset_polar_mapping(
     input_coords: np.ndarray,  # (M, 2) - (row, col)
     num_angle: int,
@@ -65,6 +72,9 @@ def forward_cartesian_to_offset_polar_mapping(
     # Convert adjusted angle to index
     angle_idx = (angle_adjusted / (2 * np.pi)) * num_angle
 
+    if not APPLY_ANGULAR_OFFSET:
+        angle_idx = (angle / (2 * np.pi)) * num_angle
+
     return np.column_stack((radius_idx, angle_idx))
 
 
@@ -107,6 +117,9 @@ def forward_offset_polar_to_cartesian_mapping(
     delta_theta = (2 * np.pi) / num_angle
     angle_offset = (ring_idx % 2) * (delta_theta / 2)
     angle_with_offset = angle + angle_offset
+
+    if not APPLY_ANGULAR_OFFSET:
+        angle_with_offset = angle
 
     # Convert to cartesian
     row = radius * np.sin(angle_with_offset) + center[0]
@@ -165,8 +178,8 @@ def inverse_offset_polar_to_cartesian_mapping(
     angle_offset = (ring_idx % 2) * (delta_theta / 2)
     angle_with_offset = angle + angle_offset
 
-    # # NOTE: Testing to remove the offset
-    # angle_with_offset = angle
+    if not APPLY_ANGULAR_OFFSET:
+        angle_with_offset = angle
 
     # Convert from polar to cartesian
     row = radius * np.sin(angle_with_offset) + center[0]
@@ -241,8 +254,8 @@ def inverse_cartesian_to_offset_polar_mapping(
         angle_adjusted >= 2 * np.pi, angle_adjusted - 2 * np.pi, angle_adjusted
     )
 
-    # # NOTE: Testing to remove the offset
-    # angle_adjusted = angle
+    if not APPLY_ANGULAR_OFFSET:
+        angle_adjusted = angle
 
     # Convert to angle index
     angle_idx = (angle_adjusted / (2 * np.pi)) * num_angle
@@ -250,3 +263,37 @@ def inverse_cartesian_to_offset_polar_mapping(
     # Return as (col, row) in polar space = (radius_idx, angle_idx)
     coords = np.column_stack((radius_idx, angle_idx))
     return coords
+
+
+def jacobian_correction_offset_polar(
+    num_angle: int,
+    num_radius: int,
+    max_radius: float,
+) -> np.ndarray:
+    """Correction factor for area element in polar coordinates.
+
+    Calculates the exact Cartesian area covered by each polar grid cell.
+    (Area of annular sector: 0.5 * (r_outer^2 - r_inner^2) * dtheta)
+
+    Parameters
+    ----------
+    num_angle : int
+        Number of angular samples in polar space.
+    num_radius : int
+        Number of radial samples in polar space.
+    max_radius : float
+        Maximum radius for the polar coordinate system.
+
+    Returns
+    -------
+    area_elements : np.ndarray
+        (num_radius,) array containing the Cartesian area of each polar pixel.
+    """
+    dr = max_radius / num_radius
+    dtheta = (2 * np.pi) / num_angle
+
+    r_inner = np.arange(num_radius) * dr
+    r_outer = r_inner + dr
+
+    area_elements = 0.5 * (r_outer**2 - r_inner**2) * dtheta
+    return area_elements
