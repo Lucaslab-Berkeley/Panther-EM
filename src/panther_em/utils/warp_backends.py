@@ -3,6 +3,10 @@
 This module provides two sets of backend functions:
 1. NumPy backend using scikit-image for CPU computation
 2. PyTorch CUDA backend using cuCIM for GPU computation
+
+NOTE: The warp backend functions only do interpolation and have no sense of quadrature
+      of the coordinate transformation. Other code sources in Panther-EM handle scaling
+      between polar/cartesian transformations.
 """
 
 from collections.abc import Callable
@@ -27,8 +31,12 @@ except ImportError:
     cucim_warp = None
 
 # GPU support requires both CUDA and cuCIM
-GPU_AVAILABLE = CUDA_AVAILABLE and CUCIM_AVAILABLE
+GPU_TRANSFORM_AVAILABLE = CUDA_AVAILABLE and CUCIM_AVAILABLE
 
+
+# TODO: Implement these as measure preserving mapping functions to ensure energy
+#       is preserved between polar and cartesian feature spaces. Should be a simple
+#       Jacobian correction factor based on the radius and angular sampling density.
 
 # ============================================================================
 # NumPy Backend (CPU)
@@ -225,7 +233,7 @@ def get_warp_function(device: Literal["numpy", "cuda"]) -> Callable:
     if device == "numpy":
         return warp_numpy
     elif device == "cuda":
-        if not GPU_AVAILABLE:
+        if not GPU_TRANSFORM_AVAILABLE:
             missing = []
             if not CUDA_AVAILABLE:
                 missing.append("CUDA (check PyTorch installation and GPU)")
