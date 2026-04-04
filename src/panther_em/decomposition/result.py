@@ -17,13 +17,15 @@ class DecompositionResult:
     Attributes
     ----------
     singular_values : np.ndarray
-        Complex singular values with shape (k_max, num_radial_components).
+        Singular values with shape (k_max, num_radial_components).
     left_singular_vectors : np.ndarray
         Left singular vectors with shape
-        (k_max, num_orientations, num_radial_components).
+        (k_max, num_fourier_filters, num_orientations, num_radial_components).
     right_singular_vectors : np.ndarray
         Right singular vectors (radial eigenvectors) with shape
         (k_max, num_radial_components, num_radial_components).
+    num_fourier_filters : int
+        Number of Fourier filters (defocus channels) used in decomposition.
     num_orientations : int
         Number of orientations used in the decomposition.
     num_angular_components : int
@@ -42,6 +44,7 @@ class DecompositionResult:
     right_singular_vectors: np.ndarray
 
     # Decomposition metadata
+    num_fourier_filters: int
     num_orientations: int
     num_angular_components: int
     num_radial_components: int
@@ -53,7 +56,13 @@ class DecompositionResult:
     def __post_init__(self) -> None:
         """Validate shapes after initialization."""
         expected_sv_shape = (self.k_max, self.num_radial_components)
-        expected_vec_shape = (
+        expected_left_shape = (
+            self.k_max,
+            self.num_fourier_filters,
+            self.num_orientations,
+            self.num_radial_components,
+        )
+        expected_right_shape = (
             self.k_max,
             self.num_radial_components,
             self.num_radial_components,
@@ -64,22 +73,26 @@ class DecompositionResult:
                 f"singular_values shape {self.singular_values.shape} "
                 f"does not match expected {expected_sv_shape}"
             )
-        if self.right_singular_vectors.shape != expected_vec_shape:
+        if self.left_singular_vectors.shape != expected_left_shape:
+            raise ValueError(
+                f"left_singular_vectors shape {self.left_singular_vectors.shape} "
+                f"does not match expected {expected_left_shape}"
+            )
+        if self.right_singular_vectors.shape != expected_right_shape:
             raise ValueError(
                 f"right_singular_vectors shape {self.right_singular_vectors.shape} "
-                f"does not match expected {expected_vec_shape}"
+                f"does not match expected {expected_right_shape}"
             )
 
     def __repr__(self) -> str:
         """String representation of the DecompositionResult."""
         return (
-            f"DecompositionResult(num_orientations={self.num_orientations}, "
+            f"DecompositionResult(num_fourier_filters={self.num_fourier_filters}, "
+            f"num_orientations={self.num_orientations}, "
             f"num_angular_components={self.num_angular_components}, "
             f"num_radial_components={self.num_radial_components}, "
             f"k_max={self.k_max}, created_at='{self.created_at}')"
         )
-
-        return
 
     def save(self, path: str | Path) -> None:
         """Save decomposition result to disk.
@@ -98,6 +111,7 @@ class DecompositionResult:
             singular_values=self.singular_values,
             left_singular_vectors=self.left_singular_vectors,
             right_singular_vectors=self.right_singular_vectors,
+            num_fourier_filters=self.num_fourier_filters,
             num_orientations=self.num_orientations,
             num_angular_components=self.num_angular_components,
             num_radial_components=self.num_radial_components,
@@ -122,15 +136,42 @@ class DecompositionResult:
         path = Path(path)
         data = np.load(path, allow_pickle=False)
 
+        left_singular_vectors = data["left_singular_vectors"]
+        num_fourier_filters = (
+            int(data["num_fourier_filters"])
+            if "num_fourier_filters" in data.files
+            else 1
+        )
+        # Backward compatibility: old format was (k_max, num_orientations, num_radial_components)
+        if left_singular_vectors.ndim == 3:
+            left_singular_vectors = left_singular_vectors[:, None, :, :]
+
         return cls(
             singular_values=data["singular_values"],
-            left_singular_vectors=data["left_singular_vectors"],
+            left_singular_vectors=left_singular_vectors,
             right_singular_vectors=data["right_singular_vectors"],
+            num_fourier_filters=num_fourier_filters,
             num_orientations=int(data["num_orientations"]),
             num_angular_components=int(data["num_angular_components"]),
             num_radial_components=int(data["num_radial_components"]),
             k_max=int(data["k_max"]),
             created_at=str(data["created_at"]),
+        )
+
+    def get_left_singular_vector(
+        self, k_idx: int, fourier_filter_idx: int, orientation_idx: int
+    ) -> np.ndarray:
+        """Get U[k, f, o, :] for one (frequency, filter, orientation)."""
+        return self.left_singular_vectors[k_idx, fourier_filter_idx, orientation_idx, :]
+
+    def get_left_singular_coefficient(
+        self, k_idx: int, fourier_filter_idx: int, orientation_idx: int, eig_idx: int
+    ) -> complex:
+        """Get U[k, f, o, eig_idx] coefficient."""
+        return complex(
+            self.left_singular_vectors[
+                k_idx, fourier_filter_idx, orientation_idx, eig_idx
+            ]
         )
 
     def get_singular_value(self, k_idx: int, eig_idx: int) -> complex:

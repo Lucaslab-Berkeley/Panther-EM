@@ -197,13 +197,13 @@ class PolarProjectionDecomposer:
         # Collapse defocus dimension into orientations for SVD:
         # (num_defocus, num_orients, num_angle, num_radius) ->
         # (num_defocus * num_orients, num_angle, num_radius)
-        num_defocus, num_orients, num_angle, num_radius = (
+        num_fourier_filters, num_orients, num_angle, num_radius = (
             polar_projections_transformed_cpu.shape
         )
         polar_projections_transformed_cpu = polar_projections_transformed_cpu.reshape(
-            num_defocus * num_orients, num_angle, num_radius
+            num_fourier_filters * num_orients, num_angle, num_radius
         )
-        num_rows = num_defocus * num_orients  # combined orientation dimension
+        num_rows = num_fourier_filters * num_orients  # combined orientation dimension
 
         # Determine k_max
         if k_max is None:
@@ -218,7 +218,7 @@ class PolarProjectionDecomposer:
             (k_max, num_radius), dtype=torch.float32, device="cpu"
         )
         left_singular_vectors = torch.zeros(
-            (k_max, num_rows, num_radius),
+            (k_max, num_fourier_filters, num_orients, num_radius),
             dtype=torch.complex64,
             device="cpu",
         )
@@ -245,8 +245,9 @@ class PolarProjectionDecomposer:
                 u, s, vh = torch.linalg.svd(freq_block, full_matrices=False)
 
                 singular_values[k] = s.cpu()
-                left_singular_vectors[k] = u.cpu()
-                # Store V (columns of right singular vectors), not Vh
+                left_singular_vectors[k] = u.reshape(
+                    num_fourier_filters, num_orients, num_radius
+                ).cpu()
                 right_singular_vectors[k] = vh.mH.cpu()
 
                 # del freq_block, u, s, vh
@@ -256,7 +257,8 @@ class PolarProjectionDecomposer:
             singular_values=singular_values.cpu().numpy().astype(np.float32),
             left_singular_vectors=left_singular_vectors.cpu().numpy(),
             right_singular_vectors=right_singular_vectors.cpu().numpy(),
-            num_orientations=num_rows,
+            num_fourier_filters=num_fourier_filters,
+            num_orientations=num_orients,
             num_angular_components=num_angle,
             num_radial_components=num_radius,
             k_max=k_max,
@@ -364,6 +366,7 @@ class PolarProjectionDecomposer:
     def reconstruct_projection(
         self,
         orientation_idx: int,
+        fourier_filter_idx: int = 0,
         num_components: int | None = None,
         output_shape: tuple[int, int] | None = None,
         return_polar: bool = False,
@@ -372,12 +375,14 @@ class PolarProjectionDecomposer:
         mode: str = "constant",
         cval: float = 0.0,
     ) -> np.ndarray | torch.Tensor:
-        """Reconstruct a Cartesian projection at a specific orientation.
+        """Reconstruct a Cartesian projection at a specific orientation/filter.
 
         Parameters
         ----------
         orientation_idx : int
             Index of the orientation to reconstruct (corresponds to phi[i], theta[i]).
+        fourier_filter_idx : int, optional
+            Index of Fourier filter channel to reconstruct. Default is 0.
         num_components : int | None, optional
             Number of singular value components to use in reconstruction.
             If None, uses all available components. Default is None.
@@ -415,14 +420,16 @@ class PolarProjectionDecomposer:
         """
         result = self.result  # Will raise if not decomposed
 
+        if fourier_filter_idx >= result.num_fourier_filters:
+            raise ValueError(
+                f"fourier_filter_idx {fourier_filter_idx} out of bounds "
+                f"(max: {result.num_fourier_filters - 1})"
+            )
         if orientation_idx >= result.num_orientations:
             raise ValueError(
                 f"orientation_idx {orientation_idx} out of bounds "
                 f"(max: {result.num_orientations - 1})"
             )
-
-        if num_components is None:
-            num_components = result.num_radial_components
 
         # Initialize polar representation
         polar_projection = torch.zeros(
@@ -446,11 +453,11 @@ class PolarProjectionDecomposer:
         for k_idx in range(result.k_max):
             # Get angular phase component
             angular_component = self._get_angular_phase_component(k_idx)
-
-            # Sum over the first num_components singular values
             for eig_idx in range(num_components):
                 # Left singular vector for this orientation and frequency
-                u_ki = left_singular_vectors[k_idx, orientation_idx, eig_idx]
+                u_ki = left_singular_vectors[
+                    k_idx, fourier_filter_idx, orientation_idx, eig_idx
+                ]
 
                 # Singular value
                 s_k = singular_values[k_idx, eig_idx]

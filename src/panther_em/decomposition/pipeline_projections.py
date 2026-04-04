@@ -248,7 +248,7 @@ def do_pipelined_projection_and_transforms(
     Returns
     -------
     torch.Tensor
-        `(num_defocus, num_projections, num_angle, num_radius)` complex64 tensor
+        `(num_fourier_filters, num_projections, num_angle, num_radius)` complex64 tensor
         on CPU (pinned memory).
     """
     if fourier_filters is None:
