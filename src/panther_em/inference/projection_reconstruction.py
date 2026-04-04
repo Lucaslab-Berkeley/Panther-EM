@@ -1,0 +1,254 @@
+"""Inference helpers for projection/feature reconstruction from decomp. results."""
+
+import numpy as np
+import torch
+
+from panther_em.decomposition.result import DecompositionResult
+from panther_em.utils.warp_transforms import OffsetPolarTransform
+
+
+class ProjectionReconstructor:
+    """Helper for reconstructing polar/cartesian features from a result."""
+
+    def __init__(
+        self,
+        result: DecompositionResult,
+        image_shape: tuple[int, int],
+        device: str | torch.device = "cpu",
+    ) -> None:
+        self.result = result
+        self.device = torch.device(device)
+        self.image_shape = image_shape
+
+        transform_device = "cuda" if self.device.type == "cuda" else "numpy"
+        self._polar_transform = OffsetPolarTransform.from_image(
+            image_shape=image_shape,
+            num_angle=result.num_angular_components,
+            num_radius=result.num_radial_components,
+            device=transform_device,  # type: ignore
+        )
+
+        self._left_singular_vectors = torch.from_numpy(result.left_singular_vectors).to(
+            device=self.device, dtype=torch.complex64
+        )
+        self._singular_values = torch.from_numpy(result.singular_values).to(
+            device=self.device, dtype=torch.float32
+        )
+        self._right_singular_vectors = torch.from_numpy(
+            result.right_singular_vectors
+        ).to(device=self.device, dtype=torch.complex64)
+
+    def clear_polar_transform_cache(self) -> None:
+        """Remove any cached interpolation grids."""
+        self._polar_transform.clear_cache()
+
+    def _get_angular_phase_component(self, k_idx: int) -> torch.Tensor:
+        """Private helper to compute phase component (circular modes)."""
+        angles = (
+            2
+            * np.pi
+            * k_idx
+            * torch.arange(
+                self.result.num_angular_components,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            / self.result.num_angular_components
+        )
+        return torch.exp(1j * angles) / np.sqrt(self.result.num_angular_components)
+
+    def construct_polar_feature(
+        self, k_idx: int, eig_idx: int, return_torch: bool = False
+    ) -> np.ndarray | torch.Tensor:
+        """Construct a polar feature for a given k_idx and eig_idx.
+
+        Parameters
+        ----------
+        k_idx : int
+            Index of the angular component (circular mode).
+        eig_idx : int
+            Index of the radial eigenvector (component).
+        return_torch : bool, optional
+            Whether to return a PyTorch tensor instead of a NumPy array, by default
+            False.
+
+        Returns
+        -------
+        np.ndarray or torch.Tensor
+            The constructed polar feature as a 2D array (angular x radial) with shape
+            (num_angular_components, num_radial_components).
+        """
+        angular_component = self._get_angular_phase_component(k_idx)
+        r_comp = torch.from_numpy(self.result.get_radial_eigenvector(k_idx, eig_idx))
+        r_comp = r_comp.to(device=self.device, dtype=torch.complex64)
+
+        polar_feature = torch.outer(angular_component, r_comp)
+
+        return polar_feature if return_torch else polar_feature.cpu().numpy()
+
+    def construct_cartesian_feature(
+        self,
+        k_idx: int,
+        eig_idx: int,
+        return_torch: bool = False,
+        order: int = 5,
+        mode: str = "constant",
+        cval: float = 0.0,
+        preserve_energy: bool = True,
+        wrap_angular_axis: bool = True,
+    ) -> np.ndarray | torch.Tensor:
+        """Construct the cartesian feature for a given k_idx and eig_idx.
+
+        Parameters
+        ----------
+        k_idx : int
+            Index of the angular component (circular mode).
+        eig_idx : int
+            Index of the radial eigenvector (component).
+        return_torch : bool, optional
+            Whether to return a PyTorch tensor instead of a NumPy array, by default
+            False.
+        order : int, optional
+            The order of the interpolation used in the polar to cartesian
+            transformation, by default 5.
+        mode : str, optional
+            The mode parameter determines how the input array is extended when the
+            transformation requires values outside of the input boundaries. By default
+            "constant".
+        cval : float, optional
+            The value to fill past edges of input if mode is "constant", by default 0.0.
+        preserve_energy : bool, optional
+            Whether to preserve the energy of the feature during the polar to cartesian
+            transformation, by default True.
+        wrap_angular_axis : bool, optional
+            Whether to wrap the angular axis during the polar to cartesian
+            transformation, by default True.
+
+        Returns
+        -------
+        np.ndarray or torch.Tensor
+            The constructed cartesian feature as a 2D array with shape corresponding to
+            the original image dimensions.
+        """
+        polar_feature = self.construct_polar_feature(k_idx, eig_idx, return_torch=True)
+
+        cartesian_feature = self._polar_transform.to_cartesian(
+            polar_feature,
+            order=order,
+            mode=mode,
+            cval=cval,
+            preserve_energy=preserve_energy,
+            wrap_angular_axis=wrap_angular_axis,
+        )
+
+        if return_torch:
+            return cartesian_feature
+        return (
+            cartesian_feature.cpu().numpy()
+            if isinstance(cartesian_feature, torch.Tensor)
+            else cartesian_feature
+        )
+
+    def reconstruct_projection(
+        self,
+        orientation_idx: int,
+        fourier_filter_idx: int = 0,
+        num_components: int | None = None,
+        return_polar: bool = False,
+        return_torch: bool = False,
+        order: int = 5,
+        mode: str = "constant",
+        cval: float = 0.0,
+        preserve_energy: bool = True,
+        wrap_angular_axis: bool = True,
+    ) -> np.ndarray | torch.Tensor:
+        """Reconstruct a projection for a given number of components.
+
+        Parameters
+        ----------
+        orientation_idx : int
+            Index of the orientation (in-plane rotation) to reconstruct.
+        fourier_filter_idx : int, optional
+            Index of the Fourier filter to reconstruct, by default 0.
+        num_components : int | None, optional
+            Number of components (eigenvectors) to use for reconstruction. If None, uses
+            all available components, by default None.
+        return_polar : bool, optional
+            Whether to return the reconstructed projection in polar coordinates instead
+            of cartesian, by default False.
+        return_torch : bool, optional
+            Whether to return a PyTorch tensor instead of a NumPy array, by default
+            False.
+        order : int, optional
+            The order of the interpolation used in the polar to cartesian
+            transformation, by default 5.
+        mode : str, optional
+            The mode parameter determines how the input array is extended when the
+            transformation requires values outside of the input boundaries. By default
+            "constant".
+        cval : float, optional
+            The value to fill past edges of input if mode is "constant", by default 0.0.
+        preserve_energy : bool, optional
+            Whether to preserve the energy of the feature during the polar to cartesian
+            transformation, by default True.
+        wrap_angular_axis : bool, optional
+            Whether to wrap the angular axis during the polar to cartesian
+            transformation, by default True.
+
+        Returns
+        -------
+        np.ndarray or torch.Tensor
+            The reconstructed projection as a 2D array in either polar or cartesian
+            coordinates, depending on the value of `return_polar`. The shape will be
+            (num_angular_components, num_radial_components) for polar coordinates or the
+            original image dimensions for cartesian coordinates.
+        """
+        if not (0 <= fourier_filter_idx < self.result.num_fourier_filters):
+            raise ValueError(
+                f"fourier_filter_idx {fourier_filter_idx} out of bounds "
+                f"(max: {self.result.num_fourier_filters - 1})"
+            )
+        if not (0 <= orientation_idx < self.result.num_orientations):
+            raise ValueError(
+                f"orientation_idx {orientation_idx} out of bounds "
+                f"(max: {self.result.num_orientations - 1})"
+            )
+
+        if num_components is None:
+            num_components = self.result.num_radial_components
+
+        polar_projection = torch.zeros(
+            (self.result.num_angular_components, self.result.num_radial_components),
+            dtype=torch.complex64,
+            device=self.device,
+        )
+
+        for k_idx in range(self.result.k_max):
+            angular_component = self._get_angular_phase_component(k_idx)
+            for eig_idx in range(num_components):
+                u_ki = self._left_singular_vectors[
+                    k_idx, fourier_filter_idx, orientation_idx, eig_idx
+                ]
+                s_k = self._singular_values[k_idx, eig_idx]
+                v_k = self._right_singular_vectors[k_idx, :, eig_idx]
+                polar_projection += torch.outer(angular_component, u_ki * s_k * v_k)
+
+        if return_polar:
+            return polar_projection if return_torch else polar_projection.cpu().numpy()
+
+        cartesian_projection = self._polar_transform.to_cartesian(
+            polar_projection,
+            order=order,
+            mode=mode,
+            cval=cval,
+            preserve_energy=preserve_energy,
+            wrap_angular_axis=wrap_angular_axis,
+        )
+
+        if return_torch:
+            return cartesian_projection
+        return (
+            cartesian_projection.cpu().numpy()
+            if isinstance(cartesian_projection, torch.Tensor)
+            else cartesian_projection
+        )

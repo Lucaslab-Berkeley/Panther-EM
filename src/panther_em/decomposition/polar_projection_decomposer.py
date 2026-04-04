@@ -7,6 +7,7 @@ import torch
 import tqdm
 
 from panther_em.decomposition.result import DecompositionResult
+from panther_em.inference.projection_reconstruction import ProjectionReconstructor
 from panther_em.utils.warp_transforms import OffsetPolarTransform
 
 from .pipeline_projections import do_pipelined_projection_and_transforms
@@ -100,7 +101,7 @@ class PolarProjectionDecomposer:
         self.num_angle = num_angle
 
         self._result: DecompositionResult | None = None
-        self._polar_transform: OffsetPolarTransform | None = None
+        self._projection_reconstructor: ProjectionReconstructor | None = None
 
     @property
     def result(self) -> DecompositionResult:
@@ -141,11 +142,30 @@ class PolarProjectionDecomposer:
         ValueError
             If decomposition has not been performed yet.
         """
-        if self._polar_transform is None:
-            raise ValueError(
-                "Polar transform not available. Call do_decomposition() first."
-            )
         return self._polar_transform
+
+    def get_projection_reconstructor(
+        self,
+        image_shape: tuple[int, int] | None = None,
+        device: str | torch.device | None = None,
+    ) -> ProjectionReconstructor:
+        """Reconstruction helper from the current decomposition result."""
+        if image_shape is None:
+            image_shape = (self.volume.shape[-2], self.volume.shape[-1])
+        target_device = self.device if device is None else torch.device(device)
+
+        if (
+            self._projection_reconstructor is None
+            or self._projection_reconstructor.image_shape != image_shape
+            or self._projection_reconstructor.device != target_device
+            or self._projection_reconstructor.result is not self.result
+        ):
+            self._projection_reconstructor = ProjectionReconstructor(
+                result=self.result,
+                image_shape=image_shape,
+                device=target_device,
+            )
+        return self._projection_reconstructor
 
     def do_decomposition(
         self,
@@ -203,7 +223,6 @@ class PolarProjectionDecomposer:
         polar_projections_transformed_cpu = polar_projections_transformed_cpu.reshape(
             num_fourier_filters * num_orients, num_angle, num_radius
         )
-        num_rows = num_fourier_filters * num_orients  # combined orientation dimension
 
         # Determine k_max
         if k_max is None:
@@ -263,105 +282,16 @@ class PolarProjectionDecomposer:
             num_radial_components=num_radius,
             k_max=k_max,
         )
-
-        # Create the polar transform for later use in reconstruction
-        self._polar_transform = OffsetPolarTransform.from_image(
-            image_shape=(self.volume.shape[-2], self.volume.shape[-1]),
-            num_angle=num_angle,
-            num_radius=num_radius,
-            device="cuda" if self.device.type == "cuda" else "numpy",
-        )
-
+        self._projection_reconstructor = None
         return self._result
-
-    def _get_angular_phase_component(self, k_idx: int) -> torch.Tensor:
-        """Get the angular phase component for a given frequency.
-
-        Parameters
-        ----------
-        k_idx : int
-            Angular frequency index.
-
-        Returns
-        -------
-        torch.Tensor
-            Angular phase array with shape (num_angle,).
-        """
-        result = self.result
-        angles = (
-            2
-            * np.pi
-            * k_idx
-            * torch.arange(
-                result.num_angular_components, device=self.device, dtype=torch.float32
-            )
-            / result.num_angular_components
-        )
-        return torch.exp(1j * angles) / np.sqrt(result.num_angular_components)
-
-    # def _undo_radial_scaling(self, radial_component: torch.Tensor) -> torch.Tensor:
-    #     """Undo the r scaling applied during decomposition.
-
-    #     Parameters
-    #     ----------
-    #     radial_component : torch.Tensor
-    #         Radial component with shape (num_radius,).
-
-    #     Returns
-    #     -------
-    #     torch.Tensor
-    #         Unscaled radial component.
-    #     """
-    #     result = self.result
-    #     r = (
-    #         torch.arange(
-    #             result.num_radial_components, device=self.device, dtype=torch.float32
-    #         )
-    #         / result.num_radial_components
-    #     )
-    #     # Avoid division by zero at r=0
-    #     return radial_component / torch.where(r > 0, r, torch.ones_like(r))
 
     def construct_polar_feature(
         self, k_idx: int, eig_idx: int, return_torch: bool = False
     ) -> np.ndarray | torch.Tensor:
-        """Construct a single polar feature for an angular frequency and eigenvalue.
-
-        Parameters
-        ----------
-        k_idx : int
-            The index of the angular frequency component.
-        eig_idx : int
-            The index of the eigenvector to use.
-        return_torch : bool, optional
-            If True, returns a torch.Tensor on the device.
-            Otherwise returns numpy array. Default is False.
-
-        Returns
-        -------
-        np.ndarray | torch.Tensor
-            A complex array for the feature in polar space with shape
-            (num_angle, num_radius).
-
-        Raises
-        ------
-        ValueError
-            If decomposition has not been performed yet.
-        """
-        result = self.result  # Will raise if not decomposed
-
-        # Get angular and radial components
-        angular_component = self._get_angular_phase_component(k_idx)
-        radial_component = torch.from_numpy(
-            result.get_radial_eigenvector(k_idx, eig_idx)
-        ).to(device=self.device, dtype=torch.complex64)
-
-        # Construct the feature by taking the outer product
-        polar_feature = torch.outer(angular_component, radial_component)
-
-        if return_torch:  # Ensure return_torch is handled correctly
-            return polar_feature
-        return polar_feature.cpu().numpy()
+        """Compatibility wrapper. Prefer ProjectionReconstructor."""
+        return self.get_projection_reconstructor().construct_polar_feature(
+            k_idx=k_idx, eig_idx=eig_idx, return_torch=return_torch
+        )
 
     def reconstruct_projection(
         self,
@@ -375,250 +305,49 @@ class PolarProjectionDecomposer:
         mode: str = "constant",
         cval: float = 0.0,
     ) -> np.ndarray | torch.Tensor:
-        """Reconstruct a Cartesian projection at a specific orientation/filter.
-
-        Parameters
-        ----------
-        orientation_idx : int
-            Index of the orientation to reconstruct (corresponds to phi[i], theta[i]).
-        fourier_filter_idx : int, optional
-            Index of Fourier filter channel to reconstruct. Default is 0.
-        num_components : int | None, optional
-            Number of singular value components to use in reconstruction.
-            If None, uses all available components. Default is None.
-        output_shape : tuple[int, int] | None, optional
-            Shape of the output Cartesian image. If None, uses the volume's
-            spatial dimensions. Default is None.
-        return_polar : bool, optional
-            If True, returns the polar representation instead of converting
-            to Cartesian. Default is False.
-        return_torch : bool, optional
-            If True, returns a torch.Tensor on the device.
-            Otherwise returns numpy array. Default is False.
-        order : int, optional
-            Interpolation order for polar to cartesian conversion (0-5).
-            Default is 5.
-        mode : str, optional
-            How to handle values outside boundaries during warping.
-            Default is "constant".
-        cval : float, optional
-            The constant value to use for padding when mode is "constant".
-            Default is 0.0.
-
-        Returns
-        -------
-        np.ndarray | torch.Tensor
-            Reconstructed projection (complex-valued).
-            Shape is (num_angle, num_radius) if return_polar is True,
-            otherwise output_shape.
-
-        Raises
-        ------
-        ValueError
-            If decomposition has not been performed yet or orientation_idx is out of
-            bounds.
-        """
-        result = self.result  # Will raise if not decomposed
-
-        if fourier_filter_idx >= result.num_fourier_filters:
-            raise ValueError(
-                f"fourier_filter_idx {fourier_filter_idx} out of bounds "
-                f"(max: {result.num_fourier_filters - 1})"
-            )
-        if orientation_idx >= result.num_orientations:
-            raise ValueError(
-                f"orientation_idx {orientation_idx} out of bounds "
-                f"(max: {result.num_orientations - 1})"
-            )
-
-        # Initialize polar representation
-        polar_projection = torch.zeros(
-            (result.num_angular_components, result.num_radial_components),
-            dtype=torch.complex64,
-            device=self.device,
+        """Compatibility wrapper. Prefer ProjectionReconstructor."""
+        output_shape = (
+            output_shape
+            if output_shape is not None
+            else (self.volume.shape[-2], self.volume.shape[-1])
+        )
+        return self.get_projection_reconstructor(
+            image_shape=output_shape
+        ).reconstruct_projection(
+            orientation_idx=orientation_idx,
+            fourier_filter_idx=fourier_filter_idx,
+            num_components=num_components,
+            return_polar=return_polar,
+            return_torch=return_torch,
+            order=order,
+            mode=mode,
+            cval=cval,
         )
 
-        # Move result arrays to device as torch tensors
-        left_singular_vectors = torch.from_numpy(result.left_singular_vectors).to(
-            device=self.device, dtype=torch.complex64
-        )
-        singular_values = torch.from_numpy(result.singular_values).to(
-            device=self.device, dtype=torch.float32
-        )
-        right_singular_vectors = torch.from_numpy(result.right_singular_vectors).to(
-            device=self.device, dtype=torch.complex64
-        )
-
-        # Reconstruct in polar space by combining SVD components
-        for k_idx in range(result.k_max):
-            # Get angular phase component
-            angular_component = self._get_angular_phase_component(k_idx)
-            for eig_idx in range(num_components):
-                # Left singular vector for this orientation and frequency
-                u_ki = left_singular_vectors[
-                    k_idx, fourier_filter_idx, orientation_idx, eig_idx
-                ]
-
-                # Singular value
-                s_k = singular_values[k_idx, eig_idx]
-
-                # Right singular vector (radial component)
-                v_k = right_singular_vectors[k_idx, :, eig_idx]
-
-                # # Undo the radial scaling applied during decomposition
-                # radial_component = self._undo_radial_scaling(v_k)
-                radial_component = v_k
-
-                # Add contribution: u * s * v for this (k, eigenvalue) pair
-                contribution = u_ki * s_k * radial_component
-                polar_projection += torch.outer(angular_component, contribution)
-
-        if return_polar:
-            if return_torch:
-                return polar_projection
-            return polar_projection.cpu().numpy()
-
-        # Convert to Cartesian space using cached transform
-        if output_shape is not None:
-            # Need to create a new transform if output shape differs
-            transform_device = "cuda" if self.device.type == "cuda" else "numpy"
-            temp_transform = OffsetPolarTransform.from_image(
-                image_shape=output_shape,
-                num_angle=result.num_angular_components,
-                num_radius=result.num_radial_components,
-                device=transform_device,  # type: ignore
-            )
-            cartesian_projection = temp_transform.to_cartesian(
-                polar_projection, order=order, mode=mode
-            )
-        else:
-            # Use cached transform
-            cartesian_projection = self.polar_transform.to_cartesian(
-                polar_projection, order=order, mode=mode
-            )
-
-        if return_torch:
-            return cartesian_projection
-        # Convert to numpy if on GPU
-        if isinstance(cartesian_projection, torch.Tensor):
-            return cartesian_projection.cpu().numpy()
-        return cartesian_projection
-
-    def construct_cartesian_feature(
-        self,
-        k_idx: int,
-        eig_idx: int,
-        output_shape: tuple[int, int] | None = None,
-        return_torch: bool = False,
-        order: int = 5,
-        mode: str = "constant",
-        cval: float = 0.0,
-        preserve_energy: bool = True,
-        wrap_angular_axis: bool = True,
-    ) -> np.ndarray | torch.Tensor:
-        """Construct a single Cartesian feature for an angular frequency and eigenvalue.
-
-        Uses the offset polar coordinate system for better spatial coverage when
-        transforming from polar to cartesian space.
-
-        Parameters
-        ----------
-        k_idx : int
-            The index of the angular frequency component.
-        eig_idx : int
-            The index of the eigenvector to use.
-        output_shape : tuple[int, int] | None, optional
-            Shape of the output Cartesian image. If None, uses the volume's
-            spatial dimensions. Default is None.
-        return_torch : bool, optional
-            If True, returns a torch.Tensor on the device.
-            Otherwise returns numpy array. Default is False.
-        order : int, optional
-            Interpolation order for polar to cartesian conversion (0-5).
-            Default is 5.
-        mode : str, optional
-            How to handle values outside boundaries during warping.
-            Default is "constant".
-        cval : float, optional
-            Value to use for constant padding. Default is 0.0.
-        preserve_energy : bool, optional
-            Whether to apply a Jacobian correction to preserve energy between polar and
-            cartesian spaces. By default True.
-        wrap_angular_axis : bool, optional
-            Whether to apply wrap padding along the angular axis *only* for proper
-            interpolation across the 360-0 degree boundary. Default is True.
-
-        Returns
-        -------
-        np.ndarray | torch.Tensor
-            A complex array for the feature in Cartesian space.
-
-        Raises
-        ------
-        ValueError
-            If decomposition has not been performed yet.
-        """
-        polar_feature = self.construct_polar_feature(k_idx, eig_idx, return_torch=True)
-
-        # Convert to cartesian using cached transform
-        if output_shape is not None:
-            # Need to create a new transform if output shape differs
-            result = self.result
-            transform_device = "cuda" if self.device.type == "cuda" else "numpy"
-            temp_transform = OffsetPolarTransform.from_image(
-                image_shape=output_shape,
-                num_angle=result.num_angular_components,
-                num_radius=result.num_radial_components,
-                device=transform_device,  # type: ignore
-            )
-            cartesian_feature = temp_transform.to_cartesian(
-                polar_feature,
-                order=order,
-                mode=mode,
-                cval=cval,
-                preserve_energy=preserve_energy,
-                wrap_angular_axis=wrap_angular_axis,
-            )
-        else:
-            # Use cached transform
-            cartesian_feature = self.polar_transform.to_cartesian(
-                polar_feature,
-                order=order,
-                mode=mode,
-                cval=cval,
-                preserve_energy=preserve_energy,
-                wrap_angular_axis=wrap_angular_axis,
-            )
-
-        if return_torch:
-            return cartesian_feature
-        # Convert to numpy if on GPU
-        if isinstance(cartesian_feature, torch.Tensor):
-            return cartesian_feature.cpu().numpy()
-        return cartesian_feature
-
-    def save_result(self, path: str | Path) -> None:
-        """Save the decomposition result to disk.
-
-        Parameters
-        ----------
-        path : str | Path
-            Path to save the result.
-
-        Raises
-        ------
-        ValueError
-            If decomposition has not been performed yet.
-        """
-        self.result.save(path)
-
-    def clear_polar_transform_cache(self) -> None:
-        """Clear the cached coordinate mappings in the polar transform.
-
-        This can free up memory when the transform is no longer needed.
-        """
-        if self._polar_transform is not None:
-            self._polar_transform.clear_cache()
+    # def construct_cartesian_feature(
+    #     self,
+    #     k_idx: int,
+    #     eig_idx: int,
+    #     output_shape: tuple[int, int] | None = None,
+    #     return_torch: bool = False,
+    #     order: int = 5,
+    #     mode: str = "constant",
+    #     cval: float = 0.0,
+    #     preserve_energy: bool = True,
+    #     wrap_angular_axis: bool = True,
+    # ) -> np.ndarray | torch.Tensor:
+    #     """Compatibility wrapper. Prefer ProjectionReconstructor."""
+    #     return self.get_projection_reconstructor().construct_cartesian_feature(
+    #         k_idx=k_idx,
+    #         eig_idx=eig_idx,
+    #         output_shape=output_shape,
+    #         return_torch=return_torch,
+    #         order=order,
+    #         mode=mode,
+    #         cval=cval,
+    #         preserve_energy=preserve_energy,
+    #         wrap_angular_axis=wrap_angular_axis,
+    #     )
 
     @classmethod
     def from_result(
@@ -672,16 +401,4 @@ class PolarProjectionDecomposer:
             device=device_obj,
         )
         instance._result = result
-
-        # Determine device string for OffsetPolarTransform
-        transform_device = "cuda" if device_obj.type == "cuda" else "numpy"
-
-        # Create the polar transform
-        instance._polar_transform = OffsetPolarTransform.from_image(
-            image_shape=(instance.volume.shape[-2], instance.volume.shape[-1]),
-            num_angle=result.num_angular_components,
-            num_radius=result.num_radial_components,
-            device=transform_device,  # type: ignore
-        )
-
         return instance
