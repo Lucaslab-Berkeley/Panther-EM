@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
 
 @dataclass
@@ -20,7 +20,7 @@ class DecompositionResult:
         Singular values with shape (k_max, num_radial_components).
     left_singular_vectors : np.ndarray
         Left singular vectors with shape
-        (k_max, num_fourier_filters, num_orientations, num_radial_components).
+        (num_fourier_filters, num_orientations, k_max, num_radial_components).
     right_singular_vectors : np.ndarray
         Right singular vectors (radial eigenvectors) with shape
         (k_max, num_radial_components, num_radial_components).
@@ -57,9 +57,9 @@ class DecompositionResult:
         """Validate shapes after initialization."""
         expected_sv_shape = (self.k_max, self.num_radial_components)
         expected_left_shape = (
-            self.k_max,
             self.num_fourier_filters,
             self.num_orientations,
+            self.k_max,
             self.num_radial_components,
         )
         expected_right_shape = (
@@ -136,21 +136,11 @@ class DecompositionResult:
         path = Path(path)
         data = np.load(path, allow_pickle=False)
 
-        left_singular_vectors = data["left_singular_vectors"]
-        num_fourier_filters = (
-            int(data["num_fourier_filters"])
-            if "num_fourier_filters" in data.files
-            else 1
-        )
-        # Backward compatibility: old format was (k_max, num_orientations, num_radial_components)
-        if left_singular_vectors.ndim == 3:
-            left_singular_vectors = left_singular_vectors[:, None, :, :]
-
         return cls(
             singular_values=data["singular_values"],
-            left_singular_vectors=left_singular_vectors,
+            left_singular_vectors=data["left_singular_vectors"],
             right_singular_vectors=data["right_singular_vectors"],
-            num_fourier_filters=num_fourier_filters,
+            num_fourier_filters=int(data["num_fourier_filters"]),
             num_orientations=int(data["num_orientations"]),
             num_angular_components=int(data["num_angular_components"]),
             num_radial_components=int(data["num_radial_components"]),
@@ -161,18 +151,21 @@ class DecompositionResult:
     def get_left_singular_vector(
         self, k_idx: int, fourier_filter_idx: int, orientation_idx: int
     ) -> np.ndarray:
-        """Get U[k, f, o, :] for one (frequency, filter, orientation)."""
-        return self.left_singular_vectors[k_idx, fourier_filter_idx, orientation_idx, :]
+        return self.left_singular_vectors[fourier_filter_idx, orientation_idx, k_idx, :]
 
     def get_left_singular_coefficient(
         self, k_idx: int, fourier_filter_idx: int, orientation_idx: int, eig_idx: int
     ) -> complex:
-        """Get U[k, f, o, eig_idx] coefficient."""
         return complex(
             self.left_singular_vectors[
-                k_idx, fourier_filter_idx, orientation_idx, eig_idx
+                fourier_filter_idx, orientation_idx, k_idx, eig_idx
             ]
         )
+
+    def get_left_singular_spectrum(
+        self, fourier_filter_idx: int, orientation_idx: int
+    ) -> np.ndarray:
+        return self.left_singular_vectors[fourier_filter_idx, orientation_idx, :, :]
 
     def get_singular_value(self, k_idx: int, eig_idx: int) -> complex:
         """Get a specific singular value.
@@ -228,22 +221,22 @@ class DecompositionResult:
             The matplotlib figure object and axes containing the scree plot.
         """
         fig, ax = plt.subplots(**kwargs)
+        svs = (
+            self.singular_values[k_idx, :]
+            if k_idx is not None
+            else self.singular_values.flatten()
+        )
+        title = (
+            f"Scree Plot for k={k_idx}"
+            if k_idx is not None
+            else "Scree Plot for All Singular Values"
+        )
 
-        if k_idx is not None:
-            svs = self.singular_values[k_idx, :]
-            title = f"Scree Plot for k={k_idx}"
-        else:
-            svs = self.singular_values.flatten()
-            title = "Scree Plot for All Singular Values"
-
-        sorted_indices = np.argsort(np.abs(svs))[::-1]
-        sorted_svs = svs[sorted_indices]
-
+        sorted_svs = svs[np.argsort(np.abs(svs))[::-1]]
         ax.plot(sorted_svs)
         ax.set_title(title)
         ax.set_xlabel("Index (sorted by magnitude)")
         ax.set_ylabel("Singular Value (magnitude)")
-
         return fig, ax
 
     def variance_explained_plot(
@@ -271,20 +264,20 @@ class DecompositionResult:
             The matplotlib figure object and axes containing the variance explained plot.
         """
         fig, ax = plt.subplots(**kwargs)
+        svs = (
+            self.singular_values[k_idx, :]
+            if k_idx is not None
+            else self.singular_values.flatten()
+        )
+        title = (
+            f"Cumulative Variance Explained for k={k_idx}"
+            if k_idx is not None
+            else "Cumulative Variance Explained for All Singular Values"
+        )
 
-        if k_idx is not None:
-            svs = self.singular_values[k_idx, :]
-            title = f"Cumulative Variance Explained for k={k_idx}"
-        else:
-            svs = self.singular_values.flatten()
-            title = "Cumulative Variance Explained for All Singular Values"
-
-        sorted_indices = np.argsort(np.abs(svs))[::-1]
-        sorted_svs = svs[sorted_indices]
-
+        sorted_svs = svs[np.argsort(np.abs(svs))[::-1]]
         denom = np.sum(np.abs(sorted_svs) ** 2)
         variance_explained = np.cumsum(np.abs(sorted_svs) ** 2) / denom
-
         if inverted:
             variance_explained = 1 - variance_explained
 
@@ -292,5 +285,4 @@ class DecompositionResult:
         ax.set_title(title)
         ax.set_xlabel("Number of Components")
         ax.set_ylabel("Cumulative Variance Explained")
-
         return fig, ax

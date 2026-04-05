@@ -227,7 +227,7 @@ class ProjectionReconstructor:
             angular_component = self._get_angular_phase_component(k_idx)
             for eig_idx in range(num_components):
                 u_ki = self._left_singular_vectors[
-                    k_idx, fourier_filter_idx, orientation_idx, eig_idx
+                    fourier_filter_idx, orientation_idx, k_idx, eig_idx
                 ]
                 s_k = self._singular_values[k_idx, eig_idx]
                 v_k = self._right_singular_vectors[k_idx, :, eig_idx]

@@ -7,8 +7,6 @@ import torch
 import tqdm
 
 from panther_em.decomposition.result import DecompositionResult
-from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-from panther_em.utils.warp_transforms import OffsetPolarTransform
 
 from .pipeline_projections import do_pipelined_projection_and_transforms
 
@@ -101,7 +99,6 @@ class PolarProjectionDecomposer:
         self.num_angle = num_angle
 
         self._result: DecompositionResult | None = None
-        self._projection_reconstructor: ProjectionReconstructor | None = None
 
     @property
     def result(self) -> DecompositionResult:
@@ -127,45 +124,6 @@ class PolarProjectionDecomposer:
     def is_decomposed(self) -> bool:
         """Check if decomposition has been performed."""
         return self._result is not None
-
-    @property
-    def polar_transform(self) -> OffsetPolarTransform:
-        """Access the polar transform for coordinate conversions.
-
-        Returns
-        -------
-        OffsetPolarTransform
-            Transform object with cached coordinate mappings.
-
-        Raises
-        ------
-        ValueError
-            If decomposition has not been performed yet.
-        """
-        return self._polar_transform
-
-    def get_projection_reconstructor(
-        self,
-        image_shape: tuple[int, int] | None = None,
-        device: str | torch.device | None = None,
-    ) -> ProjectionReconstructor:
-        """Reconstruction helper from the current decomposition result."""
-        if image_shape is None:
-            image_shape = (self.volume.shape[-2], self.volume.shape[-1])
-        target_device = self.device if device is None else torch.device(device)
-
-        if (
-            self._projection_reconstructor is None
-            or self._projection_reconstructor.image_shape != image_shape
-            or self._projection_reconstructor.device != target_device
-            or self._projection_reconstructor.result is not self.result
-        ):
-            self._projection_reconstructor = ProjectionReconstructor(
-                result=self.result,
-                image_shape=image_shape,
-                device=target_device,
-            )
-        return self._projection_reconstructor
 
     def do_decomposition(
         self,
@@ -223,6 +181,7 @@ class PolarProjectionDecomposer:
         polar_projections_transformed_cpu = polar_projections_transformed_cpu.reshape(
             num_fourier_filters * num_orients, num_angle, num_radius
         )
+        num_rows = num_fourier_filters * num_orients  # combined orientation dimension
 
         # Determine k_max
         if k_max is None:
@@ -237,7 +196,7 @@ class PolarProjectionDecomposer:
             (k_max, num_radius), dtype=torch.float32, device="cpu"
         )
         left_singular_vectors = torch.zeros(
-            (k_max, num_fourier_filters, num_orients, num_radius),
+            (num_fourier_filters, num_orients, k_max, num_radius),
             dtype=torch.complex64,
             device="cpu",
         )
@@ -264,7 +223,7 @@ class PolarProjectionDecomposer:
                 u, s, vh = torch.linalg.svd(freq_block, full_matrices=False)
 
                 singular_values[k] = s.cpu()
-                left_singular_vectors[k] = u.reshape(
+                left_singular_vectors[:, :, k, :] = u.reshape(
                     num_fourier_filters, num_orients, num_radius
                 ).cpu()
                 right_singular_vectors[k] = vh.mH.cpu()
@@ -282,72 +241,8 @@ class PolarProjectionDecomposer:
             num_radial_components=num_radius,
             k_max=k_max,
         )
-        self._projection_reconstructor = None
+
         return self._result
-
-    def construct_polar_feature(
-        self, k_idx: int, eig_idx: int, return_torch: bool = False
-    ) -> np.ndarray | torch.Tensor:
-        """Compatibility wrapper. Prefer ProjectionReconstructor."""
-        return self.get_projection_reconstructor().construct_polar_feature(
-            k_idx=k_idx, eig_idx=eig_idx, return_torch=return_torch
-        )
-
-    def reconstruct_projection(
-        self,
-        orientation_idx: int,
-        fourier_filter_idx: int = 0,
-        num_components: int | None = None,
-        output_shape: tuple[int, int] | None = None,
-        return_polar: bool = False,
-        return_torch: bool = False,
-        order: int = 5,
-        mode: str = "constant",
-        cval: float = 0.0,
-    ) -> np.ndarray | torch.Tensor:
-        """Compatibility wrapper. Prefer ProjectionReconstructor."""
-        output_shape = (
-            output_shape
-            if output_shape is not None
-            else (self.volume.shape[-2], self.volume.shape[-1])
-        )
-        return self.get_projection_reconstructor(
-            image_shape=output_shape
-        ).reconstruct_projection(
-            orientation_idx=orientation_idx,
-            fourier_filter_idx=fourier_filter_idx,
-            num_components=num_components,
-            return_polar=return_polar,
-            return_torch=return_torch,
-            order=order,
-            mode=mode,
-            cval=cval,
-        )
-
-    # def construct_cartesian_feature(
-    #     self,
-    #     k_idx: int,
-    #     eig_idx: int,
-    #     output_shape: tuple[int, int] | None = None,
-    #     return_torch: bool = False,
-    #     order: int = 5,
-    #     mode: str = "constant",
-    #     cval: float = 0.0,
-    #     preserve_energy: bool = True,
-    #     wrap_angular_axis: bool = True,
-    # ) -> np.ndarray | torch.Tensor:
-    #     """Compatibility wrapper. Prefer ProjectionReconstructor."""
-    #     return self.get_projection_reconstructor().construct_cartesian_feature(
-    #         k_idx=k_idx,
-    #         eig_idx=eig_idx,
-    #         output_shape=output_shape,
-    #         return_torch=return_torch,
-    #         order=order,
-    #         mode=mode,
-    #         cval=cval,
-    #         preserve_energy=preserve_energy,
-    #         wrap_angular_axis=wrap_angular_axis,
-    #     )
 
     @classmethod
     def from_result(
@@ -401,4 +296,5 @@ class PolarProjectionDecomposer:
             device=device_obj,
         )
         instance._result = result
+
         return instance
