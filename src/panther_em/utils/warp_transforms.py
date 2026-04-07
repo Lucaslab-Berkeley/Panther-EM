@@ -378,6 +378,7 @@ class OffsetPolarTransform:
                 self.num_angle, self.num_radius, self.radius
             )
             jac = np.sqrt(jac)
+            jac = jac.astype(np.float32)
 
             # Ensure proper shape (1, num_radius) to broadcast across angle dimension
             jac = jac.reshape(1, self.num_radius)

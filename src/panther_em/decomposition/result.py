@@ -31,7 +31,8 @@ class DecompositionResult:
     num_angular_components : int
         Number of angular components in polar space.
     num_radial_components : int
-        Number of radial components in polar space.
+        Number of radial components in polar space. Also the number of radial
+        eigenvectors stored per angular frequency component
     k_max : int
         Maximum angular frequency index used.
     created_at : str
@@ -65,7 +66,7 @@ class DecompositionResult:
         expected_right_shape = (
             self.k_max,
             self.num_radial_components,
-            self.num_radial_components,
+            self.num_radial_components,  # eigenvalue index
         )
 
         if self.singular_values.shape != expected_sv_shape:
@@ -148,58 +149,131 @@ class DecompositionResult:
             created_at=str(data["created_at"]),
         )
 
-    def get_left_singular_vector(
-        self, k_idx: int, fourier_filter_idx: int, orientation_idx: int
-    ) -> np.ndarray:
-        return self.left_singular_vectors[fourier_filter_idx, orientation_idx, k_idx, :]
-
-    def get_left_singular_coefficient(
-        self, k_idx: int, fourier_filter_idx: int, orientation_idx: int, eig_idx: int
-    ) -> complex:
-        return complex(
-            self.left_singular_vectors[
-                fourier_filter_idx, orientation_idx, k_idx, eig_idx
-            ]
-        )
-
-    def get_left_singular_spectrum(
-        self, fourier_filter_idx: int, orientation_idx: int
-    ) -> np.ndarray:
-        return self.left_singular_vectors[fourier_filter_idx, orientation_idx, :, :]
-
-    def get_singular_value(self, k_idx: int, eig_idx: int) -> complex:
-        """Get a specific singular value.
+    def get_top_k(self, top_k: int) -> np.ndarray:
+        """Get the top-k singular values across all (frequency, radial) pairs.
 
         Parameters
         ----------
-        k_idx : int
-            Angular frequency index.
-        eig_idx : int
-            Eigenvalue index.
-
-        Returns
-        -------
-        complex
-            The singular value.
-        """
-        return complex(self.singular_values[k_idx, eig_idx])
-
-    def get_radial_eigenvector(self, k_idx: int, eig_idx: int) -> np.ndarray:
-        """Get a specific radial eigenvector.
-
-        Parameters
-        ----------
-        k_idx : int
-            Angular frequency index.
-        eig_idx : int
-            Eigenvalue index.
+        top_k : int
+            Number of top singular values to retrieve.
 
         Returns
         -------
         np.ndarray
-            The radial eigenvector with shape (num_radial_components,).
+            Indices of (k_idx, eig_idx) pairs, sorted by magnitude. Shape of (top_k, 2).
         """
-        return self.right_singular_vectors[k_idx, :, eig_idx]
+        all_svs = self.singular_values.flatten()
+        all_svs_sorted = np.argsort(np.abs(all_svs))[::-1]  # reverse for largest first
+        top_indices = all_svs_sorted[:top_k]
+        k_indices, eig_indices = np.unravel_index(
+            top_indices, self.singular_values.shape
+        )
+
+        return np.stack((k_indices, eig_indices), axis=-1)
+
+    def get_component(
+        self,
+        k_idx: int | np.ndarray,  # shape (l,)
+        eig_idx: int | np.ndarray,  # shape (l,)
+        return_u: bool = True,
+        return_s: bool = True,
+        return_v: bool = True,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+        """Helper method for retrieving specific components of the SVD.
+
+        Parameters
+        ----------
+        k_idx : int | np.ndarray
+            Angular frequency index or indices to retrieve.
+        eig_idx : int | np.ndarray
+            Eigenvalue index or indices to retrieve.
+        return_u : bool, optional
+            Whether to return the left singular vectors. Default is True.
+        return_s : bool, optional
+            Whether to return the singular values. Default is True.
+        return_v : bool, optional
+            Whether to return the right singular vectors. Default is True.
+
+        Returns
+        -------
+        tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]
+            A tuple containing the requested components. Elements not selected by
+            (return_u, return_s, return_v) will be None.
+        """
+        # Must be returning at least one component
+        if not (return_u or return_s or return_v):
+            raise ValueError(
+                "At least one of return_u, return_s, return_v must be True."
+            )
+
+        k_idx = np.atleast_1d(k_idx)
+        eig_idx = np.atleast_1d(eig_idx)
+
+        u = None
+        s = None
+        v = None
+
+        if return_u:
+            u = self.left_singular_vectors[..., k_idx, eig_idx]
+        if return_s:
+            s = self.singular_values[k_idx, eig_idx]
+        if return_v:
+            v = self.right_singular_vectors[k_idx, :, eig_idx]
+
+        return u, s, v
+
+    # def get_left_singular_vector(
+    #     self, k_idx: int, fourier_filter_idx: int, orientation_idx: int
+    # ) -> np.ndarray:
+    #     return self.left_singular_vectors[fourier_filter_idx, orientation_idx, k_idx, :]
+
+    # def get_left_singular_coefficient(
+    #     self, k_idx: int, fourier_filter_idx: int, orientation_idx: int, eig_idx: int
+    # ) -> complex:
+    #     return complex(
+    #         self.left_singular_vectors[
+    #             fourier_filter_idx, orientation_idx, k_idx, eig_idx
+    #         ]
+    #     )
+
+    # def get_left_singular_spectrum(
+    #     self, fourier_filter_idx: int, orientation_idx: int
+    # ) -> np.ndarray:
+    #     return self.left_singular_vectors[fourier_filter_idx, orientation_idx, :, :]
+
+    # def get_singular_value(self, k_idx: int, eig_idx: int) -> complex:
+    #     """Get a specific singular value.
+
+    #     Parameters
+    #     ----------
+    #     k_idx : int
+    #         Angular frequency index.
+    #     eig_idx : int
+    #         Eigenvalue index.
+
+    #     Returns
+    #     -------
+    #     complex
+    #         The singular value.
+    #     """
+    #     return complex(self.singular_values[k_idx, eig_idx])
+
+    # def get_radial_eigenvector(self, k_idx: int, eig_idx: int) -> np.ndarray:
+    #     """Get a specific radial eigenvector.
+
+    #     Parameters
+    #     ----------
+    #     k_idx : int
+    #         Angular frequency index.
+    #     eig_idx : int
+    #         Eigenvalue index.
+
+    #     Returns
+    #     -------
+    #     np.ndarray
+    #         The radial eigenvector with shape (num_radial_components,).
+    #     """
+    #     return self.right_singular_vectors[k_idx, :, eig_idx]
 
     def scree_plot(
         self, k_idx: int | None = None, **kwargs: dict[str, Any]
