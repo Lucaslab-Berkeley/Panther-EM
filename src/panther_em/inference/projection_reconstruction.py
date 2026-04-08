@@ -82,7 +82,7 @@ class ProjectionReconstructor:
         _, _, v = self.result.get_component(
             k_idx, eig_idx, return_u=False, return_s=False, return_v=True
         )
-        
+
         # Squeeze out out singleton dimensions
         v = np.squeeze(v)
 
@@ -243,16 +243,17 @@ class ProjectionReconstructor:
             # Extract the specific fourier_filter and orientation
             u_ki = u[fourier_filter_idx, orientation_idx, :]  # shape (num_components,)
             s_k = s  # shape (num_components,)
-            v_k = v.T  # shape (num_components, num_radial_components)
+            v_k = v  # shape (num_components, num_radial_components)
 
             # Convert to torch tensors
             u_ki = torch.from_numpy(u_ki).to(device=self.device, dtype=torch.complex64)
             s_k = torch.from_numpy(s_k).to(device=self.device, dtype=torch.complex64)
             v_k = torch.from_numpy(v_k).to(device=self.device, dtype=torch.complex64)
 
-            # Accumulate: outer product of angular component with weighted radial components
-            weighted_radial = u_ki * s_k  # shape (num_components,)
-            polar_projection += torch.outer(angular_component, weighted_radial @ v_k)
+            # Accumulate exactly as reference eq: \sum_e U_ki[e] * S_k[e] * V_k[e, r]
+            weighted_features = u_ki * s_k  # shape (num_components,)
+            radial_contribution = weighted_features @ v_k
+            polar_projection += torch.outer(angular_component, radial_contribution)
 
         if return_polar:
             return polar_projection if return_torch else polar_projection.cpu().numpy()
