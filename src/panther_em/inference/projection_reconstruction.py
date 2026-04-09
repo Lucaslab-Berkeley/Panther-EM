@@ -28,15 +28,15 @@ class ProjectionReconstructor:
             device=transform_device,  # type: ignore
         )
 
-        self._left_singular_vectors = torch.from_numpy(result.left_singular_vectors).to(
-            device=self.device, dtype=torch.complex64
-        )
-        self._singular_values = torch.from_numpy(result.singular_values).to(
-            device=self.device, dtype=torch.complex64
-        )
-        self._right_singular_vectors = torch.from_numpy(
-            result.right_singular_vectors
-        ).to(device=self.device, dtype=torch.complex64)
+        # self._U = torch.from_numpy(result.U).to(
+        #     device=self.device, dtype=torch.complex64
+        # )
+        # self._S = torch.from_numpy(result.S).to(
+        #     device=self.device, dtype=torch.complex64
+        # )
+        # self._Vh = torch.from_numpy(result.Vh).to(
+        #     device=self.device, dtype=torch.complex64
+        # )
 
     def clear_polar_transform_cache(self) -> None:
         """Remove any cached interpolation grids."""
@@ -79,14 +79,14 @@ class ProjectionReconstructor:
             (num_angular_components, num_radial_components).
         """
         angular_component = self._get_angular_phase_component(k_idx)
-        _, _, v = self.result.get_component(
-            k_idx, eig_idx, return_u=False, return_s=False, return_v=True
+        _, _, vh = self.result.get_component(
+            k_idx, eig_idx, return_u=False, return_s=False, return_vh=True
         )
-        
-        # Squeeze out out singleton dimensions
-        v = np.squeeze(v)
 
-        v_tensor = torch.from_numpy(v).to(device=self.device, dtype=torch.complex64)
+        # Squeeze out out singleton dimensions
+        vh = np.squeeze(vh)
+
+        v_tensor = torch.from_numpy(vh).to(device=self.device, dtype=torch.complex64)
         polar_feature = torch.outer(angular_component, v_tensor)
 
         return polar_feature if return_torch else polar_feature.cpu().numpy()
@@ -232,27 +232,32 @@ class ProjectionReconstructor:
 
             # Get all components for this k_idx at once
             eig_idx_array = np.arange(num_components)
-            u, s, v = self.result.get_component(
+            u, s, vh = self.result.get_component(
                 k_idx=k_idx,
                 eig_idx=eig_idx_array,
                 return_u=True,
                 return_s=True,
-                return_v=True,
+                return_vh=True,
             )
+
+            assert u is not None
+            assert s is not None
+            assert vh is not None
 
             # Extract the specific fourier_filter and orientation
             u_ki = u[fourier_filter_idx, orientation_idx, :]  # shape (num_components,)
             s_k = s  # shape (num_components,)
-            v_k = v.T  # shape (num_components, num_radial_components)
+            vh_k = vh  # shape (num_components, num_radial_components)
 
             # Convert to torch tensors
             u_ki = torch.from_numpy(u_ki).to(device=self.device, dtype=torch.complex64)
             s_k = torch.from_numpy(s_k).to(device=self.device, dtype=torch.complex64)
-            v_k = torch.from_numpy(v_k).to(device=self.device, dtype=torch.complex64)
+            vh_k = torch.from_numpy(vh_k).to(device=self.device, dtype=torch.complex64)
 
-            # Accumulate: outer product of angular component with weighted radial components
-            weighted_radial = u_ki * s_k  # shape (num_components,)
-            polar_projection += torch.outer(angular_component, weighted_radial @ v_k)
+            # Mathematical reconstruction: \sum_e U_ki[e] * S_k[e] * Vh_k[e, r]
+            weighted_features = u_ki * s_k  # shape (num_components,)
+            radial_contribution = weighted_features @ vh_k
+            polar_projection += torch.outer(angular_component, radial_contribution)
 
         if return_polar:
             return polar_projection if return_torch else polar_projection.cpu().numpy()

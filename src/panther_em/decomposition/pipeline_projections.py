@@ -9,14 +9,16 @@ steps.
 1. Transform batch of (B, 3) ZYZ Euler angles (phi, theta, psi) into rotation matrices.
 2. Take Fourier slices from a RFFT'd 3D volume using the rotation matrices. Produces
    (B, h, w // 2 + 1) Fourier-space projections.
-3. Apply defocus offsets in Fourier space to get (f, B, h, w // 2 + 1) defocus-offset
-   Fourier-space projections.
-4. Inverse FFT into set of (f, B, h, w) defocus-offset spatial-space projections.
-5. Warp each projection in the batch into polar coordinates, producing
+3. Apply defocus offsets filters (of shape (f, h, w // 2 + 1)) in Fourier space to get
+    (f, B, h, w // 2 + 1) defocus-offset Fourier-slices projections.
+4. Inverse FFT into set of (f, B, h, w) CTF convolved cartesian-space projections.
+5. Warp cartesian-space projections in the batch into polar coordinates, producing
    (f, B, num_angle, num_radius) polar projections.
-6. Complex FFT along the angular dimension (axis=1) to get (f, B, num_angle, num_radius)
-   Fourier-space polar projections.
-7. Move batch of Fourier-space polar projections back to CPU and store for SVD step.
+6. Complex FFT along the angular dimension (axis=-2) to get
+   (f, B, num_angle, num_radius) angular-frequency-space polar projections.
+7. Move batch of angular-frequency-space polar projections to CPU for further processing
+   in the SVD pipeline.
+8. Repeat for next batch until all projections are processed.
 """
 
 import roma
@@ -276,10 +278,10 @@ def do_pipelined_projection_and_transforms(
     del volume
 
     # Allocate memory on CPU for full storage
-    num_projections = phi.shape[0]
-    num_defocus = fourier_filters.shape[0]
+    num_orientations = phi.shape[0]
+    num_filters = fourier_filters.shape[0]
     polar_projections_transformed_cpu = torch.empty(
-        (num_defocus, num_projections, num_angle, num_radius),
+        (num_filters, num_orientations, num_angle, num_radius),
         dtype=torch.complex64,
         device="cpu",
         pin_memory=True,
@@ -288,23 +290,23 @@ def do_pipelined_projection_and_transforms(
     pbar = None
     if show_progress:
         pbar = tqdm.tqdm(
-            total=num_projections,
+            total=num_orientations,
             desc="calc. projections",
             unit="proj",
         )
 
-    for start_idx in range(0, num_projections, projection_batch_size):
-        end_idx = min(start_idx + projection_batch_size, num_projections)
-        s = slice(start_idx, end_idx)
+    for start_idx in range(0, num_orientations, projection_batch_size):
+        end_idx = min(start_idx + projection_batch_size, num_orientations)
+        slice_ = slice(start_idx, end_idx)
         batch_size = end_idx - start_idx
 
         projections_polar_fft = process_batch(
             dft=dft,
             volume_mean_scaled=volume_mean_scaled,
             pad_width=pad_width,
-            phi=phi[s],
-            theta=theta[s],
-            psi=psi[s],
+            phi=phi[slice_],
+            theta=theta[slice_],
+            psi=psi[slice_],
             fourier_filters=fourier_filters,
             transformer=transformer,
             warp_polar_kwargs=warp_polar_kwargs,
@@ -312,7 +314,7 @@ def do_pipelined_projection_and_transforms(
         )
 
         # Copy to CPU pinned memory (async for overlap with next batch compute)
-        polar_projections_transformed_cpu[:, s].copy_(
+        polar_projections_transformed_cpu[:, slice_].copy_(
             projections_polar_fft, non_blocking=True
         )
         del projections_polar_fft

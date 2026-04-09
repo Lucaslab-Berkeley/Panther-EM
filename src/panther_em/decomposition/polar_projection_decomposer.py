@@ -7,13 +7,9 @@ import torch
 import tqdm
 
 from panther_em.decomposition.result import DecompositionResult
+from panther_em.inference.projection_reconstruction import ProjectionReconstructor
 
 from .pipeline_projections import do_pipelined_projection_and_transforms
-
-# TODO: Large numbers of projections (orientations) and high polar resolutions
-# (number of angular and radial components) can lead to OOM errors on GPUs. Need to
-# implements a batched way to handle portions of the data at a time handing off
-# memory between CPU/GPU.
 
 
 class PolarProjectionDecomposer:
@@ -75,6 +71,12 @@ class PolarProjectionDecomposer:
         device: str | torch.device = "cpu",
     ) -> None:
         """Initialize the polar projection decomposer."""
+        if phi_values.shape != theta_values.shape:
+            raise ValueError(
+                "phi_values and theta_values must have the same shape, "
+                f"got {phi_values.shape} and {theta_values.shape}"
+            )
+
         self.device = torch.device(device)
 
         # Convert inputs to tensors on the correct device
@@ -121,6 +123,27 @@ class PolarProjectionDecomposer:
         return self._result
 
     @property
+    def reconstructor(self) -> ProjectionReconstructor:
+        """Get a ProjectionReconstructor from the decomposition result.
+
+        Returns
+        -------
+        ProjectionReconstructor
+            A reconstructor initialized with the current decomposition result
+            and volume image shape.
+
+        Raises
+        ------
+        ValueError
+            If decomposition has not been performed yet.
+        """
+        return ProjectionReconstructor(
+            result=self.result,
+            image_shape=tuple(self.volume.shape[-2:]),
+            device=self.device,
+        )
+
+    @property
     def is_decomposed(self) -> bool:
         """Check if decomposition has been performed."""
         return self._result is not None
@@ -128,23 +151,25 @@ class PolarProjectionDecomposer:
     def do_decomposition(
         self,
         k_max: int | None = None,
+        eig_max: int | None = None,
         projection_batch_size: int = 128,
         block_batch_size: int = 8,
     ) -> DecompositionResult:
         """Run the block-circulant decomposition using the held orientations.
 
-        Generates polar projections on-the-fly and performs eigendecomposition
-        on each angular frequency block.
-
         NOTE: Computation is split into two stages: 1) on-the-fly projection generation
         plus FFT transformation 2) block-wise SVD decomposition. A barrier exists
-        between these two stages.
+        between these two stages, and intermediate results from (1) are stored on CPU
+        memory to support problem size scaling.
 
         Parameters
         ----------
         k_max : int | None, optional
             Maximum angular frequency index to compute. If None, uses all
             angular components. Default is None.
+        eig_max : int | None, optional
+            Maximum radial eigenvalue index to compute. If None, uses all
+            radial components. Default is None.
         projection_batch_size : int, optional
             Number of projections to process at a time for memory efficiency.
             Default is 128.
@@ -172,74 +197,76 @@ class PolarProjectionDecomposer:
         )
 
         # Stage 2: Decompose each frequency block with SVD
-        # Collapse defocus dimension into orientations for SVD:
-        # (num_defocus, num_orients, num_angle, num_radius) ->
-        # (num_defocus * num_orients, num_angle, num_radius)
-        num_fourier_filters, num_orients, num_angle, num_radius = (
-            polar_projections_transformed_cpu.shape
+        # Store original shape for later reshaping of results
+        batch_shape = polar_projections_transformed_cpu.shape[:-2]
+        num_angle, num_radius = polar_projections_transformed_cpu.shape[-2:]
+
+        # Flatten all outer dimensions:
+        # (..., num_angle, num_radius) -> (batch_size, num_angle, num_radius)
+        batch_size = int(np.prod(batch_shape))
+        polar_projections_reshaped = polar_projections_transformed_cpu.reshape(
+            batch_size, num_angle, num_radius
         )
-        polar_projections_transformed_cpu = polar_projections_transformed_cpu.reshape(
-            num_fourier_filters * num_orients, num_angle, num_radius
-        )
-        num_rows = num_fourier_filters * num_orients  # combined orientation dimension
 
         # Determine k_max
         if k_max is None:
             k_max = num_angle
 
-        # # Pre-compute radial scaling vector once
-        # r = torch.arange(num_radius, device=self.device, dtype=torch.float32)
-        # r = r / num_radius
+        # Determine eig_max
+        if eig_max is None:
+            eig_max = num_radius
 
         # Allocate tensors for the SVD results on CPU
-        singular_values = torch.zeros(
-            (k_max, num_radius), dtype=torch.float32, device="cpu"
+        U = torch.zeros(
+            (*batch_shape, k_max, eig_max), dtype=torch.complex64, device="cpu"
         )
-        left_singular_vectors = torch.zeros(
-            (num_fourier_filters, num_orients, k_max, num_radius),
-            dtype=torch.complex64,
-            device="cpu",
-        )
-        right_singular_vectors = torch.zeros(
-            (k_max, num_radius, num_radius),
+        S = torch.zeros((k_max, eig_max), dtype=torch.float32, device="cpu")
+        Vh = torch.zeros(
+            (k_max, eig_max, num_radius),
             dtype=torch.complex64,
             device="cpu",
         )
 
-        # Stage 2: Loop over frequency blocks in batches for SVD decomposition
+        # Stage 2: Loop over frequency blocks in batches for batched SVD decomposition
         for k_start in tqdm.tqdm(
             range(0, k_max, block_batch_size), desc="decomp freq blocks"
         ):
             k_end = min(k_start + block_batch_size, k_max)
+            num_k_batch = k_end - k_start
+            k_indices = torch.arange(k_start, k_end, device="cpu")
 
-            for k in range(k_start, k_end):
-                # Extract frequency block: (num_rows, num_radius)
-                freq_block = polar_projections_transformed_cpu[:, k, :]
-                freq_block = freq_block.to(device=self.device, non_blocking=True)
+            freq_blocks = polar_projections_reshaped[:, k_indices, :]
+            freq_blocks = freq_blocks.to(device=self.device, non_blocking=True)
 
-                # # Scale by the radial component (proper integration term r dr)
-                # freq_block_scaled = freq_block * r[None, :]
+            # Reshape from (rows, num_k_B, num_r) --> (num_k_B, rows, num_r)
+            # since we want SVD to operate on (rows, num_r)
+            freq_blocks = freq_blocks.permute(1, 0, 2)
 
-                u, s, vh = torch.linalg.svd(freq_block, full_matrices=False)
+            u, s, vh = torch.linalg.svd(freq_blocks, full_matrices=False)
 
-                singular_values[k] = s.cpu()
-                left_singular_vectors[:, :, k, :] = u.reshape(
-                    num_fourier_filters, num_orients, num_radius
-                ).cpu()
-                right_singular_vectors[k] = vh.mH.cpu()
+            u = u[..., :eig_max]
+            s = s[:, :eig_max]
+            vh = vh[:, :eig_max, :]
 
-                # del freq_block, u, s, vh
+            # Reshape outer indices for storage
+            u_reshaped = u.permute(1, 0, 2)
+            u_reshaped = u_reshaped.reshape(*batch_shape, num_k_batch, eig_max)
+
+            U[..., k_indices, :] = u_reshaped.cpu()
+            S[k_indices] = s.cpu()
+            Vh[k_indices, :, :] = vh.cpu()
 
         # Convert results back to numpy for storage
         self._result = DecompositionResult(
-            singular_values=singular_values.cpu().numpy().astype(np.float32),
-            left_singular_vectors=left_singular_vectors.cpu().numpy(),
-            right_singular_vectors=right_singular_vectors.cpu().numpy(),
-            num_fourier_filters=num_fourier_filters,
-            num_orientations=num_orients,
+            S=S.cpu().numpy().astype(np.float32),
+            U=U.cpu().numpy(),
+            Vh=Vh.cpu().numpy(),
+            k_max=k_max,
+            eig_max=eig_max,
+            num_fourier_filters=batch_shape[0] if len(batch_shape) > 0 else 1,
+            num_orientations=batch_shape[1] if len(batch_shape) > 1 else 1,
             num_angular_components=num_angle,
             num_radial_components=num_radius,
-            k_max=k_max,
         )
 
         return self._result
