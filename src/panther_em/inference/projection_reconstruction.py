@@ -28,15 +28,15 @@ class ProjectionReconstructor:
             device=transform_device,  # type: ignore
         )
 
-        self._left_singular_vectors = torch.from_numpy(result.left_singular_vectors).to(
-            device=self.device, dtype=torch.complex64
-        )
-        self._singular_values = torch.from_numpy(result.singular_values).to(
-            device=self.device, dtype=torch.complex64
-        )
-        self._right_singular_vectors = torch.from_numpy(
-            result.right_singular_vectors
-        ).to(device=self.device, dtype=torch.complex64)
+        # self._U = torch.from_numpy(result.U).to(
+        #     device=self.device, dtype=torch.complex64
+        # )
+        # self._S = torch.from_numpy(result.S).to(
+        #     device=self.device, dtype=torch.complex64
+        # )
+        # self._Vh = torch.from_numpy(result.Vh).to(
+        #     device=self.device, dtype=torch.complex64
+        # )
 
     def clear_polar_transform_cache(self) -> None:
         """Remove any cached interpolation grids."""
@@ -240,6 +240,10 @@ class ProjectionReconstructor:
                 return_v=True,
             )
 
+            assert u is not None
+            assert s is not None
+            assert v is not None
+
             # Extract the specific fourier_filter and orientation
             u_ki = u[fourier_filter_idx, orientation_idx, :]  # shape (num_components,)
             s_k = s  # shape (num_components,)
@@ -250,7 +254,7 @@ class ProjectionReconstructor:
             s_k = torch.from_numpy(s_k).to(device=self.device, dtype=torch.complex64)
             v_k = torch.from_numpy(v_k).to(device=self.device, dtype=torch.complex64)
 
-            # Accumulate exactly as reference eq: \sum_e U_ki[e] * S_k[e] * V_k[e, r]
+            # Mathematical reconstruction: \sum_e U_ki[e] * S_k[e] * Vh_k[e, r]
             weighted_features = u_ki * s_k  # shape (num_components,)
             radial_contribution = weighted_features @ v_k
             polar_projection += torch.outer(angular_component, radial_contribution)

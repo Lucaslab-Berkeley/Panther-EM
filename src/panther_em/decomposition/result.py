@@ -1,10 +1,9 @@
 """Dataclass for storing decomposition results."""
 
-from typing import Any
-
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,13 +15,13 @@ class DecompositionResult:
 
     Attributes
     ----------
-    singular_values : np.ndarray
+    S : np.ndarray
         Singular values with shape (k_max, num_radial_components).
-    left_singular_vectors : np.ndarray
+    U : np.ndarray
         Left singular vectors with shape
         (num_fourier_filters, num_orientations, k_max, num_radial_components).
-    right_singular_vectors : np.ndarray
-        Right singular vectors (radial eigenvectors) with shape
+    Vh : np.ndarray
+        Right singular vectors (conjugate transpose) with shape
         (k_max, num_radial_components, num_radial_components).
     num_fourier_filters : int
         Number of Fourier filters (defocus channels) used in decomposition.
@@ -40,9 +39,9 @@ class DecompositionResult:
     """
 
     # Core SVD components
-    singular_values: np.ndarray
-    left_singular_vectors: np.ndarray
-    right_singular_vectors: np.ndarray
+    S: np.ndarray
+    U: np.ndarray
+    Vh: np.ndarray
 
     # Decomposition metadata
     num_fourier_filters: int
@@ -56,33 +55,30 @@ class DecompositionResult:
 
     def __post_init__(self) -> None:
         """Validate shapes after initialization."""
-        expected_sv_shape = (self.k_max, self.num_radial_components)
-        expected_left_shape = (
+        expected_S_shape = (self.k_max, self.num_radial_components)
+        expected_U_shape = (
             self.num_fourier_filters,
             self.num_orientations,
             self.k_max,
             self.num_radial_components,
         )
-        expected_right_shape = (
+        expected_Vh_shape = (
             self.k_max,
             self.num_radial_components,
-            self.num_radial_components,  # eigenvalue index
+            self.num_radial_components,
         )
 
-        if self.singular_values.shape != expected_sv_shape:
+        if self.S.shape != expected_S_shape:
             raise ValueError(
-                f"singular_values shape {self.singular_values.shape} "
-                f"does not match expected {expected_sv_shape}"
+                f"S shape {self.S.shape} does not match expected {expected_S_shape}"
             )
-        if self.left_singular_vectors.shape != expected_left_shape:
+        if self.U.shape != expected_U_shape:
             raise ValueError(
-                f"left_singular_vectors shape {self.left_singular_vectors.shape} "
-                f"does not match expected {expected_left_shape}"
+                f"U shape {self.U.shape} does not match expected {expected_U_shape}"
             )
-        if self.right_singular_vectors.shape != expected_right_shape:
+        if self.Vh.shape != expected_Vh_shape:
             raise ValueError(
-                f"right_singular_vectors shape {self.right_singular_vectors.shape} "
-                f"does not match expected {expected_right_shape}"
+                f"Vh shape {self.Vh.shape} does not match expected {expected_Vh_shape}"
             )
 
     def __repr__(self) -> str:
@@ -109,9 +105,9 @@ class DecompositionResult:
 
         np.savez_compressed(
             path,
-            singular_values=self.singular_values,
-            left_singular_vectors=self.left_singular_vectors,
-            right_singular_vectors=self.right_singular_vectors,
+            S=self.S,
+            U=self.U,
+            Vh=self.Vh,
             num_fourier_filters=self.num_fourier_filters,
             num_orientations=self.num_orientations,
             num_angular_components=self.num_angular_components,
@@ -138,9 +134,9 @@ class DecompositionResult:
         data = np.load(path, allow_pickle=False)
 
         return cls(
-            singular_values=data["singular_values"],
-            left_singular_vectors=data["left_singular_vectors"],
-            right_singular_vectors=data["right_singular_vectors"],
+            S=data["S"],
+            U=data["U"],
+            Vh=data["Vh"],
             num_fourier_filters=int(data["num_fourier_filters"]),
             num_orientations=int(data["num_orientations"]),
             num_angular_components=int(data["num_angular_components"]),
@@ -162,12 +158,10 @@ class DecompositionResult:
         np.ndarray
             Indices of (k_idx, eig_idx) pairs, sorted by magnitude. Shape of (top_k, 2).
         """
-        all_svs = self.singular_values.flatten()
+        all_svs = self.S.flatten()
         all_svs_sorted = np.argsort(np.abs(all_svs))[::-1]  # reverse for largest first
         top_indices = all_svs_sorted[:top_k]
-        k_indices, eig_indices = np.unravel_index(
-            top_indices, self.singular_values.shape
-        )
+        k_indices, eig_indices = np.unravel_index(top_indices, self.S.shape)
 
         return np.stack((k_indices, eig_indices), axis=-1)
 
@@ -214,66 +208,13 @@ class DecompositionResult:
         v = None
 
         if return_u:
-            u = self.left_singular_vectors[..., k_idx, eig_idx]
+            u = self.U[..., k_idx, eig_idx]
         if return_s:
-            s = self.singular_values[k_idx, eig_idx]
+            s = self.S[k_idx, eig_idx]
         if return_v:
-            v = self.right_singular_vectors[k_idx, :, eig_idx]
+            v = self.Vh[k_idx, eig_idx]
 
         return u, s, v
-
-    # def get_left_singular_vector(
-    #     self, k_idx: int, fourier_filter_idx: int, orientation_idx: int
-    # ) -> np.ndarray:
-    #     return self.left_singular_vectors[fourier_filter_idx, orientation_idx, k_idx, :]
-
-    # def get_left_singular_coefficient(
-    #     self, k_idx: int, fourier_filter_idx: int, orientation_idx: int, eig_idx: int
-    # ) -> complex:
-    #     return complex(
-    #         self.left_singular_vectors[
-    #             fourier_filter_idx, orientation_idx, k_idx, eig_idx
-    #         ]
-    #     )
-
-    # def get_left_singular_spectrum(
-    #     self, fourier_filter_idx: int, orientation_idx: int
-    # ) -> np.ndarray:
-    #     return self.left_singular_vectors[fourier_filter_idx, orientation_idx, :, :]
-
-    # def get_singular_value(self, k_idx: int, eig_idx: int) -> complex:
-    #     """Get a specific singular value.
-
-    #     Parameters
-    #     ----------
-    #     k_idx : int
-    #         Angular frequency index.
-    #     eig_idx : int
-    #         Eigenvalue index.
-
-    #     Returns
-    #     -------
-    #     complex
-    #         The singular value.
-    #     """
-    #     return complex(self.singular_values[k_idx, eig_idx])
-
-    # def get_radial_eigenvector(self, k_idx: int, eig_idx: int) -> np.ndarray:
-    #     """Get a specific radial eigenvector.
-
-    #     Parameters
-    #     ----------
-    #     k_idx : int
-    #         Angular frequency index.
-    #     eig_idx : int
-    #         Eigenvalue index.
-
-    #     Returns
-    #     -------
-    #     np.ndarray
-    #         The radial eigenvector with shape (num_radial_components,).
-    #     """
-    #     return self.right_singular_vectors[k_idx, :, eig_idx]
 
     def scree_plot(
         self, k_idx: int | None = None, **kwargs: dict[str, Any]
@@ -295,11 +236,7 @@ class DecompositionResult:
             The matplotlib figure object and axes containing the scree plot.
         """
         fig, ax = plt.subplots(**kwargs)
-        svs = (
-            self.singular_values[k_idx, :]
-            if k_idx is not None
-            else self.singular_values.flatten()
-        )
+        svs = self.S[k_idx, :] if k_idx is not None else self.S.flatten()
         title = (
             f"Scree Plot for k={k_idx}"
             if k_idx is not None
@@ -335,14 +272,11 @@ class DecompositionResult:
         Returns
         -------
         plt.Figure, plt.Axes
-            The matplotlib figure object and axes containing the variance explained plot.
+            The matplotlib figure object and axes containing the variance explained
+            plot.
         """
         fig, ax = plt.subplots(**kwargs)
-        svs = (
-            self.singular_values[k_idx, :]
-            if k_idx is not None
-            else self.singular_values.flatten()
-        )
+        svs = self.S[k_idx, :] if k_idx is not None else self.S.flatten()
         title = (
             f"Cumulative Variance Explained for k={k_idx}"
             if k_idx is not None
