@@ -7,6 +7,7 @@ import torch
 import tqdm
 
 from panther_em.decomposition.result import DecompositionResult
+from panther_em.inference.projection_reconstruction import ProjectionReconstructor
 
 from .pipeline_projections import do_pipelined_projection_and_transforms
 
@@ -120,6 +121,27 @@ class PolarProjectionDecomposer:
                 "Decomposition not yet performed. Call do_decomposition() first."
             )
         return self._result
+
+    @property
+    def reconstructor(self) -> ProjectionReconstructor:
+        """Get a ProjectionReconstructor from the decomposition result.
+
+        Returns
+        -------
+        ProjectionReconstructor
+            A reconstructor initialized with the current decomposition result
+            and volume image shape.
+
+        Raises
+        ------
+        ValueError
+            If decomposition has not been performed yet.
+        """
+        return ProjectionReconstructor(
+            result=self.result,
+            image_shape=tuple(self.volume.shape[-2:]),
+            device=self.device,
+        )
 
     @property
     def is_decomposed(self) -> bool:
