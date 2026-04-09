@@ -129,6 +129,7 @@ class PolarProjectionDecomposer:
     def do_decomposition(
         self,
         k_max: int | None = None,
+        eig_max: int | None = None,
         projection_batch_size: int = 128,
         block_batch_size: int = 8,
     ) -> DecompositionResult:
@@ -144,6 +145,9 @@ class PolarProjectionDecomposer:
         k_max : int | None, optional
             Maximum angular frequency index to compute. If None, uses all
             angular components. Default is None.
+        eig_max : int | None, optional
+            Maximum radial eigenvalue index to compute. If None, uses all
+            radial components. Default is None.
         projection_batch_size : int, optional
             Number of projections to process at a time for memory efficiency.
             Default is 128.
@@ -186,13 +190,17 @@ class PolarProjectionDecomposer:
         if k_max is None:
             k_max = num_angle
 
+        # Determine eig_max
+        if eig_max is None:
+            eig_max = num_radius
+
         # Allocate tensors for the SVD results on CPU
         U = torch.zeros(
-            (*batch_shape, k_max, num_radius), dtype=torch.complex64, device="cpu"
+            (*batch_shape, k_max, eig_max), dtype=torch.complex64, device="cpu"
         )
-        S = torch.zeros((k_max, num_radius), dtype=torch.float32, device="cpu")
+        S = torch.zeros((k_max, eig_max), dtype=torch.float32, device="cpu")
         Vh = torch.zeros(
-            (k_max, num_radius, num_radius),
+            (k_max, eig_max, num_radius),
             dtype=torch.complex64,
             device="cpu",
         )
@@ -214,9 +222,13 @@ class PolarProjectionDecomposer:
 
             u, s, vh = torch.linalg.svd(freq_blocks, full_matrices=False)
 
+            u = u[..., :eig_max]
+            s = s[:, :eig_max]
+            vh = vh[:, :eig_max, :]
+
             # Reshape outer indices for storage
             u_reshaped = u.permute(1, 0, 2)
-            u_reshaped = u_reshaped.reshape(*batch_shape, num_k_batch, num_radius)
+            u_reshaped = u_reshaped.reshape(*batch_shape, num_k_batch, eig_max)
 
             U[..., k_indices, :] = u_reshaped.cpu()
             S[k_indices] = s.cpu()
@@ -227,11 +239,12 @@ class PolarProjectionDecomposer:
             S=S.cpu().numpy().astype(np.float32),
             U=U.cpu().numpy(),
             Vh=Vh.cpu().numpy(),
+            k_max=k_max,
+            eig_max=eig_max,
             num_fourier_filters=batch_shape[0] if len(batch_shape) > 0 else 1,
             num_orientations=batch_shape[1] if len(batch_shape) > 1 else 1,
             num_angular_components=num_angle,
             num_radial_components=num_radius,
-            k_max=k_max,
         )
 
         return self._result

@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+import textwrap
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -13,13 +14,27 @@ import numpy as np
 class DecompositionResult:
     """Stores the full results of a polar projection decomposition.
 
+    Note
+    ----
+    The structure of the block-circulant SVD imposes a structure on the singular values
+    where each singular value is associated with a specific angular frequency index
+    `k_idx` in the range of `[0, k_max)` and a radial eigenvalue index `eig_idx` in the
+    range of `[0, eig_max)`. Usually, `eig_max = num_radial_components`, but this can be
+    less if only a subset of eigenvalues were retained during decomposition.
+
+    The left-singular-vectors (`U`) have shape (..., k_idx, eig_idx), the
+    singular-values (`S`) have shape (k_idx, eig_idx), and the right-singular-vectors
+    (`Vh`) have shape (k_idx, eig_idx, num_radial_components). Helper methods exist for
+    querying the top L pairs based on singular value magnitude; similar methods exist
+    for retrieving the corresponding singular vectors and values.
+
     Attributes
     ----------
-    S : np.ndarray
-        Singular values with shape (k_max, num_radial_components).
     U : np.ndarray
         Left singular vectors with shape
         (num_fourier_filters, num_orientations, k_max, num_radial_components).
+    S : np.ndarray
+        Singular values with shape (k_max, num_radial_components).
     Vh : np.ndarray
         Right singular vectors (conjugate transpose) with shape
         (k_max, num_radial_components, num_radial_components).
@@ -39,32 +54,35 @@ class DecompositionResult:
     """
 
     # Core SVD components
-    S: np.ndarray
     U: np.ndarray
+    S: np.ndarray
     Vh: np.ndarray
+
+    # Shapes for singular values
+    k_max: int
+    eig_max: int
 
     # Decomposition metadata
     num_fourier_filters: int
     num_orientations: int
     num_angular_components: int
     num_radial_components: int
-    k_max: int
 
     # Timestamp
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def __post_init__(self) -> None:
         """Validate shapes after initialization."""
-        expected_S_shape = (self.k_max, self.num_radial_components)
         expected_U_shape = (
             self.num_fourier_filters,
             self.num_orientations,
             self.k_max,
-            self.num_radial_components,
+            self.eig_max,
         )
+        expected_S_shape = (self.k_max, self.eig_max)
         expected_Vh_shape = (
             self.k_max,
-            self.num_radial_components,
+            self.eig_max,
             self.num_radial_components,
         )
 
@@ -83,13 +101,21 @@ class DecompositionResult:
 
     def __repr__(self) -> str:
         """String representation of the DecompositionResult."""
-        return (
-            f"DecompositionResult(num_fourier_filters={self.num_fourier_filters}, "
-            f"num_orientations={self.num_orientations}, "
-            f"num_angular_components={self.num_angular_components}, "
-            f"num_radial_components={self.num_radial_components}, "
-            f"k_max={self.k_max}, created_at='{self.created_at}')"
+        s = textwrap.dedent(
+            f"""
+            DecompositionResult(
+                k_max={self.k_max},
+                eig_max={self.eig_max},
+                num_fourier_filters={self.num_fourier_filters},
+                num_orientations={self.num_orientations},
+                num_angular_components={self.num_angular_components},
+                num_radial_components={self.num_radial_components},
+                created_at='{self.created_at}'
+            )
+            """
         )
+
+        return s.strip()
 
     def save(self, path: str | Path) -> None:
         """Save decomposition result to disk.
@@ -171,7 +197,7 @@ class DecompositionResult:
         eig_idx: int | np.ndarray,  # shape (l,)
         return_u: bool = True,
         return_s: bool = True,
-        return_v: bool = True,
+        return_vh: bool = True,
     ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
         """Helper method for retrieving specific components of the SVD.
 
@@ -185,19 +211,19 @@ class DecompositionResult:
             Whether to return the left singular vectors. Default is True.
         return_s : bool, optional
             Whether to return the singular values. Default is True.
-        return_v : bool, optional
+        return_vh : bool, optional
             Whether to return the right singular vectors. Default is True.
 
         Returns
         -------
         tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]
             A tuple containing the requested components. Elements not selected by
-            (return_u, return_s, return_v) will be None.
+            (return_u, return_s, return_vh) will be None.
         """
         # Must be returning at least one component
-        if not (return_u or return_s or return_v):
+        if not (return_u or return_s or return_vh):
             raise ValueError(
-                "At least one of return_u, return_s, return_v must be True."
+                "At least one of return_u, return_s, return_vh must be True."
             )
 
         k_idx = np.atleast_1d(k_idx)
@@ -205,16 +231,16 @@ class DecompositionResult:
 
         u = None
         s = None
-        v = None
+        vh = None
 
         if return_u:
             u = self.U[..., k_idx, eig_idx]
         if return_s:
             s = self.S[k_idx, eig_idx]
-        if return_v:
-            v = self.Vh[k_idx, eig_idx]
+        if return_vh:
+            vh = self.Vh[k_idx, eig_idx]
 
-        return u, s, v
+        return u, s, vh
 
     def scree_plot(
         self, k_idx: int | None = None, **kwargs: dict[str, Any]
