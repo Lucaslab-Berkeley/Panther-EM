@@ -118,8 +118,9 @@ def project_from_precomputed_dft(
     if pad_width > 0:
         projections = F.pad(projections, pad=[-pad_width] * 4)
 
-    # Add back the mean
-    projections += volume_mean_scaled
+    # TEST: Try keeping zero-mean projections
+    # # Add back the mean
+    # projections += volume_mean_scaled
 
     return projections
 
