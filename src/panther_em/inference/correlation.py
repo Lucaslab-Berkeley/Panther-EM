@@ -42,77 +42,8 @@ from panther_em.decomposition.result import DecompositionResult
 from panther_em.inference.projection_reconstruction import ProjectionReconstructor
 
 
-# NOTE: Handled by the result object now
-# # ---------------------------------------------------------------------------
-# # Stage 1 — Index selection
-# # ---------------------------------------------------------------------------
-
-
-# def select_indices(
-#     result: DecompositionResult,
-#     *,
-#     k_indices: Optional[torch.Tensor] = None,
-#     eig_indices: Optional[torch.Tensor] = None,
-#     top_k: Optional[int] = None,
-#     device: Optional[torch.device] = None,
-# ) -> torch.Tensor:
-#     """Return `(N, 2)` integer tensor of `[k_idx, eig_idx]` pairs to use.
-
-#     Parameters
-#     ----------
-#     result : DecompositionResult
-#         Decomposition whose `singular_values` defines the index space.
-#     k_indices : torch.Tensor, optional
-#         1-D integer tensor of angular-frequency indices `k ∈ [0, k_max)`.
-#     eig_indices : torch.Tensor, optional
-#         1-D integer tensor of radial-eigenvalue indices
-#         `eig \in [0, num_radial_components)`.
-#     top_k : int, optional
-#         If given, overrides grid arguments and selects the `top_k`
-#         components ranked by `|S|`.
-#     device : torch.device, optional
-#         Device for the returned index tensor.  Defaults to CPU.
-
-#     Returns
-#     -------
-#     torch.Tensor
-#         Integer tensor of shape `(N, 2)` — column 0 is `k_idx`, column 1
-#         is `eig_idx`.
-#     """
-#     _has_fixed_indices = (k_indices is not None) or (eig_indices is not None)
-#     if top_k is not None and _has_fixed_indices:
-#         raise ValueError(
-#             "top_k selection is mutually exclusive with k_indices / eig_indices."
-#         )
-
-#     sv = torch.from_numpy(result.singular_values)  # (k_max, R)
-#     if device is not None:
-#         sv = sv.to(device)
-
-#     # if top_k was requested, set k_indices and eig_indices as the top ranked components
-#     if top_k is not None:
-#         top_k = sv.numel if top_k == -1 else top_k
-
-#         flat_sv = sv.flatten()
-#         _, flat_ordering = flat_sv.abs().topk(top_k)
-#         k_indices = flat_ordering // result.num_radial_components
-#         eig_indices = flat_ordering % result.num_radial_components
-
-#     # Otherwise, ensure k_indices and eig_indices are both not None
-#     if k_indices is None and eig_indices is None:
-#         raise ValueError(
-#             "Either 'top_k' or both 'k_indices' and 'eig_indices' must be provided."
-#         )
-
-#     k_indices = k_indices.to(sv.device)
-#     eig_indices = eig_indices.to(sv.device)
-#     ki, ei = torch.meshgrid(k_indices, eig_indices, indexing="ij")
-
-#     return torch.stack([ki.flatten(), ei.flatten()], dim=1)
-
-
 # ---------------------------------------------------------------------------
-# Stage 2 — Kernel construction and feature-stack computation
+# Kernel construction and feature-stack computation
 # ---------------------------------------------------------------------------
 
 
@@ -123,7 +54,7 @@ def build_cartesian_kernels(
 ) -> torch.Tensor:
     """Construct the Cartesian spatial kernels for each selected index pair.
 
-    Each kernel `V[k, eig]` is built by
+    Each kernel ``V[k, eig]`` is built by
     :meth:`ProjectionReconstructor.construct_cartesian_feature`, which
     composes the analytic angular phase component with the radial eigenvector
     and inverse-maps the result to Cartesian coordinates via the stored
@@ -201,13 +132,13 @@ def compute_feature_stack(
     # Outer product: unsqueeze to (B, 1, H, W) and (1, L, H, W), then multiply
     corr_fft = image_fft.unsqueeze(1) * kernels_fft.conj().unsqueeze(0)
     corr = torch.fft.ifft2(corr_fft)
-    # corr = corr[..., : H - h + 1, : W - w + 1]
+    corr = corr[..., : H - h + 1, : W - w + 1]
 
     return corr
 
 
 # ---------------------------------------------------------------------------
-# Stage 3 — Weights and tensor contraction
+# Weights construction and tensor contraction
 # ---------------------------------------------------------------------------
 
 
@@ -362,10 +293,8 @@ def compute_correlogram(
     kH, kW = reconstructor.image_shape
     H = image.shape[-2]
     W = image.shape[-1]
-    # out_H = H - kH + 1
-    # out_W = W - kW + 1
-    out_H = kW
-    out_W = kW
+    out_H = H - kH + 1
+    out_W = W - kW + 1
 
     _has_batch = image.dim() == 4
     B = image.shape[0] if _has_batch else None
@@ -404,14 +333,8 @@ def compute_correlogram(
         kernels = build_cartesian_kernels(
             reconstructor, chunk_indices, **polar_to_cart_kwargs
         )
-        # ### DEBUGGING: Do no correlation
-        # F_chunk = compute_feature_stack(image, kernels)
-        F_chunk = kernels
-
+        F_chunk = compute_feature_stack(image, kernels)
         W_chunk = compute_weights(result, chunk_indices)
-
-        # ### DEBUGGING: Return F_chunk and W_chunk
-        # return kernels, F_chunk, W_chunk
 
         accumulator = accumulator + contract_features(W_chunk, F_chunk)
 

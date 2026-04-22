@@ -263,8 +263,8 @@ class PolarProjectionDecomposer:
             Vh=Vh.cpu().numpy(),
             k_max=k_max,
             eig_max=eig_max,
-            num_fourier_filters=batch_shape[0] if len(batch_shape) > 0 else 1,
-            num_orientations=batch_shape[1] if len(batch_shape) > 1 else 1,
+            num_fourier_filters=batch_shape[0],
+            num_orientations=batch_shape[1],
             num_angular_components=num_angle,
             num_radial_components=num_radius,
         )
