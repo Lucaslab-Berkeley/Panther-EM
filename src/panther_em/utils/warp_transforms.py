@@ -45,6 +45,25 @@ from .warp_backends import (
 _TRANSFORMER_CACHE = {}
 
 
+def _normalize_transform_device(
+    device: Literal["numpy"] | str | torch.device,
+) -> Literal["numpy"] | torch.device:
+    """Normalize transform device to either 'numpy' or a concrete CUDA device."""
+    if device == "numpy":
+        return "numpy"
+
+    device_obj = device if isinstance(device, torch.device) else torch.device(device)
+
+    if device_obj.type == "cuda":
+        return device_obj
+    if device_obj.type == "cpu":
+        return "numpy"
+
+    raise ValueError(
+        f"Unsupported device type: {device_obj}. Supported: 'numpy' or CUDA device."
+    )
+
+
 def _get_bhw_of_image(image: np.ndarray | torch.Tensor) -> tuple[int | None, int, int]:
     """Utility function to get the batch, height, and width of an image."""
     if image.ndim == 3:
@@ -201,10 +220,10 @@ class OffsetPolarTransform:
         Height of the cartesian image.
     width : int
         Width of the cartesian image.
-    device : {"numpy", "cuda"}, optional
-        Computational device. If "cuda", all input arrays/tensors must be
-        PyTorch CUDA tensors. If "numpy", inputs must be NumPy arrays or
-        CPU PyTorch tensors. By default "numpy".
+    device : {"numpy"} | str | torch.device, optional
+        Computational device. CUDA devices may be provided as strings (e.g.
+        "cuda:1") or torch.device objects. If "numpy"/CPU, inputs must be NumPy
+        arrays or CPU PyTorch tensors. By default "numpy".
 
     Methods
     -------
@@ -238,7 +257,7 @@ class OffsetPolarTransform:
         num_radius: int,
         height: int,
         width: int,
-        device: Literal["numpy", "cuda"] = "numpy",
+        device: Literal["numpy"] | str | torch.device = "numpy",
     ) -> None:
         """Initialize OffsetPolarTransform."""
         self.center = center
@@ -247,7 +266,7 @@ class OffsetPolarTransform:
         self.num_radius = num_radius
         self.height = height
         self.width = width
-        self.device = device
+        self.device = _normalize_transform_device(device)
 
         # Get the appropriate warp function for this device
         self._warp_fn = get_warp_function(device)
@@ -265,7 +284,7 @@ class OffsetPolarTransform:
         num_radius: int | None = None,
         center: tuple[float, float] | None = None,
         radius: float | None = None,
-        device: Literal["numpy", "cuda"] = "numpy",
+        device: Literal["numpy"] | str | torch.device = "numpy",
     ) -> "OffsetPolarTransform":
         """Create an OffsetPolarTransform instance from image shape and parameters."""
         height, width = image_shape

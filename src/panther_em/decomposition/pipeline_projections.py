@@ -119,8 +119,8 @@ def project_from_precomputed_dft(
         projections = F.pad(projections, pad=[-pad_width] * 4)
 
     # TEST: Try keeping zero-mean projections
-    # # Add back the mean
-    # projections += volume_mean_scaled
+    # Add back the mean
+    projections += volume_mean_scaled
 
     return projections
 
@@ -267,7 +267,7 @@ def do_pipelined_projection_and_transforms(
     )
 
     # Initialize the coordinate transformer to use across batches
-    transform_device = "cuda" if volume.is_cuda else "numpy"
+    transform_device = volume.device if volume.is_cuda else "numpy"
     transformer = OffsetPolarTransform.from_image(
         image_shape=(volume.shape[1], volume.shape[2]),
         num_angle=num_angle,

@@ -164,20 +164,23 @@ def warp_torch_cuda(
 
     device = image.device
 
-    # Convert PyTorch tensors to CuPy arrays (zero-copy via DLPack)
-    image_cp = cp.from_dlpack(image.detach())
-    coords_cp = cp.from_dlpack(coords.detach())
+    # Ensure current CUDA device matches tensor device for DLPack interop.
+    # Use context manager to avoid changing global state permanently.
+    with torch.cuda.device(device):
+        # Convert PyTorch tensors to CuPy arrays (zero-copy via DLPack)
+        image_cp = cp.from_dlpack(image.detach())
+        coords_cp = cp.from_dlpack(coords.detach())
 
-    # Perform warp on GPU using cuCIM
-    warped_cp = cucim_warp(
-        image_cp,
-        coords_cp,
-        output_shape=output_shape,
-        order=order,
-        mode=mode,
-        cval=cval,
-        **kwargs,
-    )
+        # Perform warp on GPU using cuCIM
+        warped_cp = cucim_warp(
+            image_cp,
+            coords_cp,
+            output_shape=output_shape,
+            order=order,
+            mode=mode,
+            cval=cval,
+            **kwargs,
+        )
 
     # Convert back to PyTorch tensor (zero-copy via DLPack)
     warped_torch = torch.from_dlpack(warped_cp)
@@ -194,7 +197,7 @@ def warp_torch_cuda(
 # ============================================================================
 
 
-def detect_device(array: np.ndarray | torch.Tensor) -> Literal["numpy", "cuda"]:
+def detect_device(array: np.ndarray | torch.Tensor) -> Literal["numpy"] | torch.device:
     """Detect whether an array is on CPU (numpy) or GPU (torch CUDA).
 
     Parameters
@@ -204,25 +207,25 @@ def detect_device(array: np.ndarray | torch.Tensor) -> Literal["numpy", "cuda"]:
 
     Returns
     -------
-    str
-        Either "numpy" for CPU arrays or "cuda" for CUDA tensors.
+    str | torch.device
+        "numpy" for CPU arrays or the concrete CUDA device for CUDA tensors.
     """
     if isinstance(array, torch.Tensor):
         if array.is_cuda:
-            return "cuda"
+            return array.device
         else:
             return "numpy"  # CPU torch tensors treated as numpy
 
     return "numpy"
 
 
-def get_warp_function(device: Literal["numpy", "cuda"]) -> Callable:
+def get_warp_function(device: Literal["numpy"] | torch.device) -> Callable:
     """Get the appropriate warp function for the specified device.
 
     Parameters
     ----------
-    device : {"numpy", "cuda"}
-        Device type.
+    device : {"numpy"} or torch.device
+        Device type. CUDA devices must be provided as torch.device.
 
     Returns
     -------
@@ -240,7 +243,7 @@ def get_warp_function(device: Literal["numpy", "cuda"]) -> Callable:
     """
     if device == "numpy":
         return warp_numpy
-    elif device == "cuda":
+    elif isinstance(device, torch.device) and device.type == "cuda":
         if not GPU_TRANSFORM_AVAILABLE:
             missing = []
             if not CUDA_AVAILABLE:
@@ -252,12 +255,14 @@ def get_warp_function(device: Literal["numpy", "cuda"]) -> Callable:
             )
         return warp_torch_cuda
     else:
-        raise ValueError(f"Unsupported device: {device}. Supported: 'numpy', 'cuda'")
+        raise ValueError(
+            f"Unsupported device: {device}. Supported: 'numpy' or torch.device('cuda[:index]')"
+        )
 
 
 def validate_same_device(
     *arrays: np.ndarray | torch.Tensor,
-) -> Literal["numpy", "cuda"]:
+) -> Literal["numpy"] | torch.device:
     """Validate that all arrays are on the same device.
 
     Parameters
@@ -267,8 +272,8 @@ def validate_same_device(
 
     Returns
     -------
-    str
-        The common device ("numpy" or "cuda").
+    str | torch.device
+        The common device ("numpy" or a concrete CUDA torch.device).
 
     Raises
     ------
@@ -287,13 +292,14 @@ def validate_same_device(
 
     # Check all are same type (numpy vs cuda)
     first_device = devices[0]
-    if not all(d == first_device for d in devices):
+    first_is_numpy = first_device == "numpy"
+    if not all((d == "numpy") == first_is_numpy for d in devices):
         raise ValueError(
             f"All arrays must be on the same device type. Got: {set(devices)}"
         )
 
     # If CUDA, check all on same GPU device
-    if first_device == "cuda":
+    if first_device != "numpy":
         cuda_devices = [arr.device for arr in arrays if isinstance(arr, torch.Tensor)]
         if not all(d == cuda_devices[0] for d in cuda_devices):
             raise RuntimeError(
@@ -305,7 +311,7 @@ def validate_same_device(
 
 
 def ensure_device(
-    array: np.ndarray | torch.Tensor, target_device: Literal["numpy", "cuda"]
+    array: np.ndarray | torch.Tensor, target_device: Literal["numpy"] | torch.device
 ) -> np.ndarray | torch.Tensor:
     """Convert array to the target device if necessary.
 
@@ -313,8 +319,8 @@ def ensure_device(
     ----------
     array : np.ndarray or torch.Tensor
         Input array.
-    target_device : {"numpy", "cuda"}
-        Target device.
+    target_device : {"numpy"} or torch.device
+        Target device. CUDA targets must be provided as torch.device.
 
     Returns
     -------
@@ -337,7 +343,7 @@ def ensure_device(
             return array.cpu().numpy()
         return np.asarray(array)
 
-    elif target_device == "cuda":
+    elif isinstance(target_device, torch.device) and target_device.type == "cuda":
         # Convert to CUDA tensor
         if not CUDA_AVAILABLE:
             raise RuntimeError(
@@ -345,10 +351,10 @@ def ensure_device(
             )
 
         if isinstance(array, np.ndarray):
-            return torch.from_numpy(array).cuda()
+            return torch.from_numpy(array).to(device=target_device)
         elif isinstance(array, torch.Tensor):
-            return array.cuda()
+            return array.to(device=target_device)
         else:
-            return torch.tensor(array).cuda()
+            return torch.tensor(array, device=target_device)
 
     raise ValueError(f"Unsupported target device: {target_device}")

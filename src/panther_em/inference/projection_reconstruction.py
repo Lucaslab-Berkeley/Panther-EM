@@ -20,7 +20,7 @@ class ProjectionReconstructor:
         self.device = torch.device(device)
         self.image_shape = image_shape
 
-        transform_device = "cuda" if self.device.type == "cuda" else "numpy"
+        transform_device = self.device if self.device.type == "cuda" else "numpy"
         self._polar_transform = OffsetPolarTransform.from_image(
             image_shape=image_shape,
             num_angle=result.num_angular_components,
