@@ -272,7 +272,7 @@ def do_pipelined_projection_and_transforms(
         image_shape=(volume.shape[1], volume.shape[2]),
         num_angle=num_angle,
         num_radius=num_radius,
-        device=transform_device,  # type: ignore
+        device=transform_device,
     )
 
     # Free the original volume from GPU since we only need the DFT now

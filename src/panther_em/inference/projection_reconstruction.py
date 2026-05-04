@@ -6,6 +6,8 @@ import torch
 from panther_em.decomposition.result import DecompositionResult
 from panther_em.utils.warp_transforms import OffsetPolarTransform
 
+# TODO: Add batched reconstruction modes for GPU pipelining
+
 
 class ProjectionReconstructor:
     """Helper for reconstructing polar/cartesian features from a result."""
@@ -25,7 +27,7 @@ class ProjectionReconstructor:
             image_shape=image_shape,
             num_angle=result.num_angular_components,
             num_radius=result.num_radial_components,
-            device=transform_device,  # type: ignore
+            device=transform_device,
         )
 
         # self._U = torch.from_numpy(result.U).to(
@@ -42,8 +44,19 @@ class ProjectionReconstructor:
         """Remove any cached interpolation grids."""
         self._polar_transform.clear_cache()
 
-    def _get_angular_phase_component(self, k_idx: int) -> torch.Tensor:
-        """Private helper to compute phase component (circular modes)."""
+    def _get_angular_phase_component(
+        self, k_idx: int, phase_shift: float
+    ) -> torch.Tensor:
+        """Private helper to compute phase component (circular modes).
+
+        Parameters
+        ----------
+        k_idx : int
+            Index of angular frequency component (circular mode).
+        phase_shift : float
+            Phase shift to apply to the angular component, in degrees. Enables in-plane
+            rotation simulation.
+        """
         angles = (
             2
             * np.pi
@@ -55,10 +68,16 @@ class ProjectionReconstructor:
             )
             / self.result.num_angular_components
         )
+        phase_shift_rad = np.deg2rad(phase_shift)
+        angles += phase_shift_rad
         return torch.exp(1j * angles) / np.sqrt(self.result.num_angular_components)
 
     def construct_polar_feature(
-        self, k_idx: int, eig_idx: int, return_torch: bool = False
+        self,
+        k_idx: int,
+        eig_idx: int,
+        in_plane_rotation: float = 0.0,
+        return_torch: bool = False,
     ) -> np.ndarray | torch.Tensor:
         """Construct a polar feature for a given k_idx and eig_idx.
 
@@ -68,6 +87,8 @@ class ProjectionReconstructor:
             Index of the angular component (circular mode).
         eig_idx : int
             Index of the radial eigenvector (component).
+        in_plane_rotation : float, optional
+            In-plane rotation angle in degrees, by default 0.0.
         return_torch : bool, optional
             Whether to return a PyTorch tensor instead of a NumPy array, by default
             False.
@@ -78,7 +99,7 @@ class ProjectionReconstructor:
             The constructed polar feature as a 2D array (angular x radial) with shape
             (num_angular_components, num_radial_components).
         """
-        angular_component = self._get_angular_phase_component(k_idx)
+        angular_component = self._get_angular_phase_component(k_idx, in_plane_rotation)
         _, _, vh = self.result.get_component(
             k_idx, eig_idx, return_u=False, return_s=False, return_vh=True
         )
@@ -95,6 +116,7 @@ class ProjectionReconstructor:
         self,
         k_idx: int,
         eig_idx: int,
+        in_plane_rotation: float = 0.0,
         return_torch: bool = False,
         order: int = 5,
         mode: str = "constant",
@@ -110,6 +132,8 @@ class ProjectionReconstructor:
             Index of the angular component (circular mode).
         eig_idx : int
             Index of the radial eigenvector (component).
+        in_plane_rotation : float, optional
+            In-plane rotation angle in degrees, by default 0.0.
         return_torch : bool, optional
             Whether to return a PyTorch tensor instead of a NumPy array, by default
             False.
@@ -135,7 +159,9 @@ class ProjectionReconstructor:
             The constructed cartesian feature as a 2D array with shape corresponding to
             the original image dimensions.
         """
-        polar_feature = self.construct_polar_feature(k_idx, eig_idx, return_torch=True)
+        polar_feature = self.construct_polar_feature(
+            k_idx, eig_idx, in_plane_rotation, return_torch=True
+        )
 
         cartesian_feature = self._polar_transform.to_cartesian(
             polar_feature,
@@ -152,6 +178,7 @@ class ProjectionReconstructor:
         self,
         orientation_idx: int,
         fourier_filter_idx: int = 0,
+        in_plane_rotation: float = 0.0,
         num_components: int | None = None,
         return_polar: bool = False,
         return_torch: bool = False,
@@ -169,6 +196,9 @@ class ProjectionReconstructor:
             Index of the orientation (in-plane rotation) to reconstruct.
         fourier_filter_idx : int, optional
             Index of the Fourier filter to reconstruct, by default 0.
+        in_plane_rotation : float, optional
+            The in-plane rotation angle for the reconstruction, in degrees. Analytically
+            applies a phase-shift to the constructed angular components. By default 0.0.
         num_components : int | None, optional
             Number of top components (by singular value magnitude) to use for
             reconstruction. If None, uses all available components, by default None.
@@ -230,7 +260,9 @@ class ProjectionReconstructor:
         )
 
         # Group indices by k_idx for efficient accumulation
-        k_idx_groups = {k_idx: [] for k_idx in range(self.result.k_max)}
+        k_idx_groups: dict[int, list[int]] = {
+            k_idx: [] for k_idx in range(self.result.k_max)
+        }
         for k_idx, eig_idx in top_k_indices:
             k_idx_groups[k_idx].append(eig_idx)
 
@@ -242,7 +274,9 @@ class ProjectionReconstructor:
                 continue
 
             eig_indices = np.array(eig_indices)
-            angular_component = self._get_angular_phase_component(k_idx)
+            angular_component = self._get_angular_phase_component(
+                k_idx, in_plane_rotation
+            )
 
             u, s, vh = self.result.get_component(
                 k_idx=int(k_idx),

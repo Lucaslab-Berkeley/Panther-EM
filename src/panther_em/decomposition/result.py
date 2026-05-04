@@ -101,8 +101,7 @@ class DecompositionResult:
 
     def __repr__(self) -> str:
         """String representation of the DecompositionResult."""
-        s = textwrap.dedent(
-            f"""
+        s = textwrap.dedent(f"""
             DecompositionResult(
                 k_max={self.k_max},
                 eig_max={self.eig_max},
@@ -112,8 +111,7 @@ class DecompositionResult:
                 num_radial_components={self.num_radial_components},
                 created_at='{self.created_at}'
             )
-            """
-        )
+            """)
 
         return s.strip()
 
@@ -139,6 +137,7 @@ class DecompositionResult:
             num_angular_components=self.num_angular_components,
             num_radial_components=self.num_radial_components,
             k_max=self.k_max,
+            eig_max=self.eig_max,
             created_at=self.created_at,
         )
 
@@ -168,6 +167,7 @@ class DecompositionResult:
             num_angular_components=int(data["num_angular_components"]),
             num_radial_components=int(data["num_radial_components"]),
             k_max=int(data["k_max"]),
+            eig_max=int(data["eig_max"]),
             created_at=str(data["created_at"]),
         )
 
