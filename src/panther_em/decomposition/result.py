@@ -1,9 +1,9 @@
 """Dataclass for storing decomposition results."""
 
+import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-import textwrap
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -99,6 +99,9 @@ class DecompositionResult:
                 f"Vh shape {self.Vh.shape} does not match expected {expected_Vh_shape}"
             )
 
+        # Per-instance cache for top-n queries
+        self._top_n_cache: dict[int, np.ndarray] = {}
+
     def __repr__(self) -> str:
         """String representation of the DecompositionResult."""
         s = textwrap.dedent(f"""
@@ -171,25 +174,17 @@ class DecompositionResult:
             created_at=str(data["created_at"]),
         )
 
-    def get_top_k(self, top_k: int) -> np.ndarray:
-        """Get the top-k singular values across all (frequency, radial) pairs.
+    # @lru_cache(maxsize=32)  # often repeated queries
+    def get_top_n(self, top_k: int) -> np.ndarray:
+        """Get the top-n singular values across all (frequency, radial) pairs."""
+        if top_k not in self._top_n_cache:
+            all_svs = self.S.flatten()
+            all_svs_sorted = np.argsort(np.abs(all_svs))[::-1]
+            top_indices = all_svs_sorted[:top_k]
+            k_indices, eig_indices = np.unravel_index(top_indices, self.S.shape)
+            self._top_n_cache[top_k] = np.stack((k_indices, eig_indices), axis=-1)
 
-        Parameters
-        ----------
-        top_k : int
-            Number of top singular values to retrieve.
-
-        Returns
-        -------
-        np.ndarray
-            Indices of (k_idx, eig_idx) pairs, sorted by magnitude. Shape of (top_k, 2).
-        """
-        all_svs = self.S.flatten()
-        all_svs_sorted = np.argsort(np.abs(all_svs))[::-1]  # reverse for largest first
-        top_indices = all_svs_sorted[:top_k]
-        k_indices, eig_indices = np.unravel_index(top_indices, self.S.shape)
-
-        return np.stack((k_indices, eig_indices), axis=-1)
+        return self._top_n_cache[top_k]
 
     def get_component(
         self,

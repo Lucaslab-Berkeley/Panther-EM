@@ -34,13 +34,13 @@ Note for computational and memory efficiency reasons, steps 2 and 3 may be batch
 across singular values (e.g. split selected indices into smaller chunks).
 """
 
-from typing import Any, Iterator, Optional
+from collections.abc import Iterator
+from typing import Any
 
 import torch
 
 from panther_em.decomposition.result import DecompositionResult
 from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-
 
 # ---------------------------------------------------------------------------
 # Kernel construction and feature-stack computation
@@ -123,8 +123,8 @@ def compute_feature_stack(
             f"Kernels must have exactly 3 dimensions (L, kH, kW), got {kernels.dim()}"
         )
 
-    B, H, W = image.shape
-    L, h, w = kernels.shape
+    _B, H, W = image.shape
+    _L, h, w = kernels.shape
 
     image_fft = torch.fft.fft2(image)
     kernels_fft = torch.fft.fft2(kernels, s=(H, W))
@@ -233,10 +233,10 @@ def compute_correlogram(
     image: torch.Tensor,
     reconstructor: ProjectionReconstructor,
     *,
-    k_indices: Optional[torch.Tensor] = None,
-    eig_indices: Optional[torch.Tensor] = None,
-    top_k: Optional[int] = None,
-    chunk_size: Optional[int] = None,
+    k_indices: torch.Tensor | None = None,
+    eig_indices: torch.Tensor | None = None,
+    top_k: int | None = None,
+    chunk_size: int | None = None,
     **polar_to_cart_kwargs: Any,
 ) -> torch.Tensor:
     """Compute the orientation-dependent cross-correlogram end-to-end.
@@ -281,11 +281,11 @@ def compute_correlogram(
     ValueError
         If no index pairs are selected.
 
-    # Examples
-    # --------
-    # >>> reconstructor = ProjectionReconstructor(result, image_shape=(256, 256))
-    # >>> C = compute_correlogram(micrograph_patch, reconstructor, top_k=32, chunk_size=8)
-    # >>> C.shape  # e.g. (1, num_fourier_filters, num_orientations, 256, 256)
+    Examples
+    --------
+    >>> reconstructor = ProjectionReconstructor(result, image_shape=(256, 256))
+    >>> C = compute_correlogram(micrograph_patch, reconstructor, top_k=32, chunk_size=8)
+    >>> C.shape  # e.g. (1, num_fourier_filters, num_orientations, 256, 256)
     """
     result = reconstructor.result
     device = reconstructor.device
@@ -298,7 +298,7 @@ def compute_correlogram(
 
     _has_batch = image.dim() == 4
     B = image.shape[0] if _has_batch else None
-    FF, O = result.num_fourier_filters, result.num_orientations
+    FF, _O = result.num_fourier_filters, result.num_orientations
     out_shape = (B, FF, O, out_H, out_W) if _has_batch else (FF, O, out_H, out_W)
 
     accumulator = torch.zeros(out_shape, dtype=torch.complex64, device=device)
@@ -310,7 +310,7 @@ def compute_correlogram(
             raise ValueError(
                 "Must provide either 'top_k' or both 'k_indices' and 'eig_indices'."
             )
-        top_k_indices = result.get_top_k(top_k=top_k)
+        top_k_indices = result.get_top_n(top_k=top_k)
         top_k_indices = torch.from_numpy(top_k_indices).to(device)
     else:
         if k_indices is None or eig_indices is None:
@@ -350,8 +350,8 @@ def estimate_memory_bytes(
     result: DecompositionResult,
     image_shape: tuple[int, ...],
     *,
-    n_selected: Optional[int] = None,
-    chunk_size: Optional[int] = None,
+    n_selected: int | None = None,
+    chunk_size: int | None = None,
     dtype: torch.dtype = torch.complex64,
 ) -> dict[str, int]:
     """Estimate peak memory for a :func:`compute_correlogram` call.
@@ -395,7 +395,7 @@ def estimate_memory_bytes(
     H, W = image_shape[-2], image_shape[-1]
     B = image_shape[0] if len(image_shape) == 4 else 1
     FF = result.num_fourier_filters
-    O = result.num_orientations
+    _O = result.num_orientations
 
     kernel_bytes = chunk * kH * kW * bpe  # (chunk, kH, kW)
     feature_bytes = B * chunk * H * W * bpe  # (B, chunk, H, W)

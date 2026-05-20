@@ -285,7 +285,7 @@ def do_pipelined_projection_and_transforms(
         (num_filters, num_orientations, num_angle, num_radius),
         dtype=torch.complex64,
         device="cpu",
-        pin_memory=True,
+        pin_memory=False,
     )
 
     pbar = None

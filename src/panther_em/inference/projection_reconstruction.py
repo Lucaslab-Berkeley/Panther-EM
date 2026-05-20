@@ -6,8 +6,6 @@ import torch
 from panther_em.decomposition.result import DecompositionResult
 from panther_em.utils.warp_transforms import OffsetPolarTransform
 
-# TODO: Add batched reconstruction modes for GPU pipelining
-
 
 class ProjectionReconstructor:
     """Helper for reconstructing polar/cartesian features from a result."""
@@ -30,19 +28,31 @@ class ProjectionReconstructor:
             device=transform_device,
         )
 
-        # self._U = torch.from_numpy(result.U).to(
-        #     device=self.device, dtype=torch.complex64
-        # )
-        # self._S = torch.from_numpy(result.S).to(
-        #     device=self.device, dtype=torch.complex64
-        # )
-        # self._Vh = torch.from_numpy(result.Vh).to(
-        #     device=self.device, dtype=torch.complex64
-        # )
+        self._U = torch.tensor(result.U, dtype=torch.complex64, device=self.device)
+        self._S = torch.tensor(result.S, dtype=torch.complex64, device=self.device)
+        self._Vh = torch.tensor(result.Vh, dtype=torch.complex64, device=self.device)
 
     def clear_polar_transform_cache(self) -> None:
         """Remove any cached interpolation grids."""
         self._polar_transform.clear_cache()
+
+    def _resolve_num_components(self, num_components: int | None) -> int:
+        """Parse possible 'None' value for num_components and enforce max limit."""
+        max_components = self.result.k_max * self.result.eig_max
+
+        if num_components is None:
+            return max_components
+
+        return min(num_components, max_components)
+
+    def _build_k_idx_groups(self, num_components: int) -> dict[int, list[int]]:
+        """Group eig_indices by their corresponding k_idx for the top-n components."""
+        groups: dict[int, list[int]] = {k: [] for k in range(self.result.k_max)}
+
+        for k_idx, eig_idx in self.result.get_top_n(num_components):
+            groups[k_idx].append(eig_idx)
+
+        return groups
 
     def _get_angular_phase_component(
         self, k_idx: int, phase_shift: float
@@ -57,20 +67,40 @@ class ProjectionReconstructor:
             Phase shift to apply to the angular component, in degrees. Enables in-plane
             rotation simulation.
         """
-        angles = (
-            2
-            * np.pi
-            * k_idx
-            * torch.arange(
-                self.result.num_angular_components,
-                device=self.device,
-                dtype=torch.float32,
-            )
-            / self.result.num_angular_components
-        )
         phase_shift_rad = np.deg2rad(phase_shift)
-        angles += phase_shift_rad
-        return torch.exp(1j * angles) / np.sqrt(self.result.num_angular_components)
+
+        N = self.result.num_angular_components
+        n = torch.arange(N, device=self.device, dtype=torch.float32)
+        base_angles = 2.0 * np.pi * k_idx * n / N
+        angles = base_angles + phase_shift_rad
+
+        return torch.exp(1j * angles) / np.sqrt(N)
+
+    def _get_angular_phase_components_batch(
+        self, k_idx: int, phase_shifts: torch.Tensor
+    ) -> torch.Tensor:
+        """Batched angular phase component for a vector of phase shifts.
+
+        Parameters
+        ----------
+        k_idx : int
+            Angular frequency index.
+        phase_shifts : torch.Tensor
+            Phase shifts in degrees, shape (B,).
+
+        Returns
+        -------
+        torch.Tensor
+            Complex angular components, shape (B, num_angular_components).
+        """
+        phase_shifts_rad = phase_shifts * (np.pi / 180.0)
+
+        N = self.result.num_angular_components
+        n = torch.arange(N, device=self.device, dtype=torch.float32)
+        base_angles = 2.0 * np.pi * k_idx * n / N
+        angles = base_angles[None, :] + phase_shifts_rad[:, None]
+
+        return torch.exp(1j * angles) / np.sqrt(N)
 
     def construct_polar_feature(
         self,
@@ -100,14 +130,7 @@ class ProjectionReconstructor:
             (num_angular_components, num_radial_components).
         """
         angular_component = self._get_angular_phase_component(k_idx, in_plane_rotation)
-        _, _, vh = self.result.get_component(
-            k_idx, eig_idx, return_u=False, return_s=False, return_vh=True
-        )
-
-        # Squeeze out out singleton dimensions
-        vh = np.squeeze(vh)
-
-        v_tensor = torch.from_numpy(vh).to(device=self.device, dtype=torch.complex64)
+        v_tensor = self._Vh[k_idx, eig_idx]
         polar_feature = torch.outer(angular_component, v_tensor)
 
         return polar_feature if return_torch else polar_feature.cpu().numpy()
@@ -243,70 +266,33 @@ class ProjectionReconstructor:
                 f"(max: {self.result.num_orientations - 1})"
             )
 
-        if num_components is None:
-            num_components = self.result.k_max * self.result.eig_max
-        else:
-            num_components = min(
-                num_components, self.result.k_max * self.result.eig_max
-            )
+        num_components = self._resolve_num_components(num_components)
+        k_idx_groups = self._build_k_idx_groups(num_components)
 
-        top_k_indices = self.result.get_top_k(num_components)
-
-        # Accumulate weighted features in polar space, only one warp transform needed.
         polar_projection = torch.zeros(
             (self.result.num_angular_components, self.result.num_radial_components),
             dtype=torch.complex64,
             device=self.device,
         )
 
-        # Group indices by k_idx for efficient accumulation
-        k_idx_groups: dict[int, list[int]] = {
-            k_idx: [] for k_idx in range(self.result.k_max)
-        }
-        for k_idx, eig_idx in top_k_indices:
-            k_idx_groups[k_idx].append(eig_idx)
-
-        for k_idx in sorted(k_idx_groups.keys()):
-            eig_indices = k_idx_groups[k_idx]
-
+        for k_idx, eig_indices in sorted(k_idx_groups.items()):
             # If no components to process
             if not eig_indices:
                 continue
 
-            eig_indices = np.array(eig_indices)
-            angular_component = self._get_angular_phase_component(
-                k_idx, in_plane_rotation
-            )
+            eig_idx_tensor = torch.tensor(eig_indices, device=self.device)
 
-            u, s, vh = self.result.get_component(
-                k_idx=int(k_idx),
-                eig_idx=eig_indices,
-                return_u=True,
-                return_s=True,
-                return_vh=True,
-            )
-
-            assert u is not None
-            assert s is not None
-            assert vh is not None
-
-            # Extract the specific fourier_filter and orientation
-            u_ki = u[fourier_filter_idx, orientation_idx]  # shape (num_components,)
-            s_k = s  # shape (num_components,)
-            vh_k = vh  # shape (num_components, num_radial_components)
-
-            # Convert to torch tensors
-            u_ki = np.array(u_ki, dtype=np.complex64)
-            u_ki = torch.from_numpy(u_ki).to(device=self.device, dtype=torch.complex64)
-
-            s_k = np.array(s_k, dtype=np.complex64)
-            s_k = torch.from_numpy(s_k).to(device=self.device, dtype=torch.complex64)
-
-            vh_k = torch.from_numpy(vh_k).to(device=self.device, dtype=torch.complex64)
+            u_ki = self._U[fourier_filter_idx, orientation_idx, k_idx, eig_idx_tensor]
+            s_k = self._S[k_idx, eig_idx_tensor]
+            vh_k = self._Vh[k_idx, eig_idx_tensor]
 
             # Mathematical reconstruction: U_ki * S_k * Vh_k
             weighted_features = u_ki * s_k
             radial_contribution = weighted_features @ vh_k
+
+            angular_component = self._get_angular_phase_component(
+                k_idx, in_plane_rotation
+            )
 
             polar_projection += torch.outer(angular_component, radial_contribution)
 
@@ -328,4 +314,123 @@ class ProjectionReconstructor:
             cartesian_projection.cpu().numpy()
             if isinstance(cartesian_projection, torch.Tensor)
             else cartesian_projection
+        )
+
+    def reconstruct_projection_batch(
+        self,
+        queries: list[tuple[int, int, float]],
+        num_components: int | None = None,
+        return_polar: bool = False,
+        return_torch: bool = False,
+        order: int = 5,
+        mode: str = "constant",
+        cval: float = 0.0,
+        preserve_energy: bool = True,
+        wrap_angular_axis: bool = True,
+    ) -> np.ndarray | torch.Tensor:
+        """Reconstruct projections for a batch of queries in one pass.
+
+        Parameters
+        ----------
+        queries : list[tuple[int, int, float]]
+            Each entry is
+            (orientation_idx, fourier_filter_idx, in_plane_rotation_degrees).
+        num_components : int | None, optional
+            Number of top components to use. None uses all, by default None.
+        return_polar : bool, optional
+            Return in polar coordinates (B, A, R) instead of cartesian (B, H, W),
+            by default False.
+        return_torch : bool, optional
+            Return a torch.Tensor instead of np.ndarray, by default False.
+        order : int, optional
+            Interpolation order for polar-to-cartesian warp, by default 5.
+        mode : str, optional
+            Boundary mode for warp, by default "constant".
+        cval : float, optional
+            Fill value when mode is "constant", by default 0.0.
+        preserve_energy : bool, optional
+            Apply Jacobian correction during warp, by default True.
+        wrap_angular_axis : bool, optional
+            Wrap angular axis during warp, by default True.
+
+        Returns
+        -------
+        np.ndarray or torch.Tensor
+            Shape (B, H, W) in cartesian or (B, A, R) in polar coordinates.
+        """
+        orientation_indices, ff_indices, in_plane_rotations = zip(
+            *queries, strict=False
+        )
+
+        for ff_idx in ff_indices:
+            if not (0 <= ff_idx < self.result.num_fourier_filters):
+                raise ValueError(
+                    f"fourier_filter_idx {ff_idx} out of bounds "
+                    f"(max: {self.result.num_fourier_filters - 1})"
+                )
+        for ori_idx in orientation_indices:
+            if not (0 <= ori_idx < self.result.num_orientations):
+                raise ValueError(
+                    f"orientation_idx {ori_idx} out of bounds "
+                    f"(max: {self.result.num_orientations - 1})"
+                )
+
+        B = len(queries)
+        num_components = self._resolve_num_components(num_components)
+        k_idx_groups = self._build_k_idx_groups(num_components)
+
+        orient_batch = torch.tensor(list(orientation_indices), device=self.device)
+        ff_batch = torch.tensor(list(ff_indices), device=self.device)
+        phase_shifts = torch.tensor(
+            list(in_plane_rotations), device=self.device, dtype=torch.float32
+        )
+
+        polar_projections = torch.zeros(
+            (B, self.result.num_angular_components, self.result.num_radial_components),
+            dtype=torch.complex64,
+            device=self.device,
+        )
+
+        for k_idx in sorted(k_idx_groups.keys()):
+            eig_indices = k_idx_groups[k_idx]
+            if not eig_indices:
+                continue
+
+            eig_idx_tensor = torch.tensor(eig_indices, device=self.device)
+
+            # angular_batch: (B, A)
+            angular_batch = self._get_angular_phase_components_batch(
+                k_idx, phase_shifts
+            )
+
+            # u_batch: (B, E) via broadcast indexing over orientation and ff axes
+            u_batch = self._U[
+                ff_batch[:, None], orient_batch[:, None], k_idx, eig_idx_tensor[None, :]
+            ]
+            s_k = self._S[k_idx, eig_idx_tensor]  # (E,)
+            vh_k = self._Vh[k_idx, eig_idx_tensor]  # (E, R)
+
+            radial = (u_batch * s_k[None, :]) @ vh_k  # (B, R)
+            polar_projections += angular_batch[:, :, None] * radial[:, None, :]
+
+        if return_polar:
+            return (
+                polar_projections if return_torch else polar_projections.cpu().numpy()
+            )
+
+        cartesian_projections = self._polar_transform.to_cartesian(
+            polar_projections,
+            order=order,
+            mode=mode,
+            cval=cval,
+            preserve_energy=preserve_energy,
+            wrap_angular_axis=wrap_angular_axis,
+        )
+
+        if return_torch:
+            return cartesian_projections
+        return (
+            cartesian_projections.cpu().numpy()
+            if isinstance(cartesian_projections, torch.Tensor)
+            else cartesian_projections
         )
