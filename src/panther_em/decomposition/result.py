@@ -19,25 +19,31 @@ class DecompositionResult:
     The structure of the block-circulant SVD imposes a structure on the singular values
     where each singular value is associated with a specific angular frequency index
     `k_idx` in the range of `[0, k_max)` and a radial eigenvalue index `eig_idx` in the
-    range of `[0, eig_max)`. Usually, `eig_max = num_radial_components`, but this can be
-    less if only a subset of eigenvalues were retained during decomposition.
+    range of `[0, eig_max)`.
 
-    The left-singular-vectors (`U`) have shape (..., k_idx, eig_idx), the
-    singular-values (`S`) have shape (k_idx, eig_idx), and the right-singular-vectors
-    (`Vh`) have shape (k_idx, eig_idx, num_radial_components). Helper methods exist for
-    querying the top L pairs based on singular value magnitude; similar methods exist
-    for retrieving the corresponding singular vectors and values.
+    For complex-valued underlying projection data there will be
+    `num_freq_blocks = k_max * 2 + 1` total frequency blocks corresponding to the
+    positive and negative frequencies including the DC (k=0) component. When projection
+    data is real-valued, only the non-negative frequencies are stored, so
+    `num_freq_blocks = k_max + 1`, but negative frequencies can still be indexed.
+
+    The left-singular-vectors (`U`) have shape (..., num_freq_blocks, eig_idx), the
+    singular-values (`S`) have shape (num_freq_blocks, eig_idx), and the
+    right-singular-vectors (`Vh`) have shape (num_freq_blocks, eig_idx,
+    num_radial_components). Helper methods exist for querying the top L pairs based on
+    singular value magnitude; similar methods exist for retrieving the corresponding
+    singular vectors and values.
 
     Attributes
     ----------
     U : np.ndarray
         Left singular vectors with shape
-        (num_fourier_filters, num_orientations, k_max, num_radial_components).
+        (num_fourier_filters, num_orientations, num_freq_blocks, num_radial_components).
     S : np.ndarray
-        Singular values with shape (k_max, num_radial_components).
+        Singular values with shape (num_freq_blocks, num_radial_components).
     Vh : np.ndarray
         Right singular vectors (conjugate transpose) with shape
-        (k_max, num_radial_components, num_radial_components).
+        (num_freq_blocks, num_radial_components, num_radial_components).
     num_fourier_filters : int
         Number of Fourier filters (defocus channels) used in decomposition.
     num_orientations : int
@@ -61,6 +67,7 @@ class DecompositionResult:
     # Shapes for singular values
     k_max: int
     eig_max: int
+    is_complex_projection: bool
 
     # Decomposition metadata
     num_fourier_filters: int
@@ -73,15 +80,17 @@ class DecompositionResult:
 
     def __post_init__(self) -> None:
         """Validate shapes after initialization."""
+        num_freq_blocks = self.k_max * 2 if self.is_complex_projection else self.k_max
+
         expected_U_shape = (
             self.num_fourier_filters,
             self.num_orientations,
-            self.k_max,
+            num_freq_blocks,
             self.eig_max,
         )
-        expected_S_shape = (self.k_max, self.eig_max)
+        expected_S_shape = (num_freq_blocks, self.eig_max)
         expected_Vh_shape = (
-            self.k_max,
+            num_freq_blocks,
             self.eig_max,
             self.num_radial_components,
         )
@@ -108,6 +117,7 @@ class DecompositionResult:
             DecompositionResult(
                 k_max={self.k_max},
                 eig_max={self.eig_max},
+                is_complex_projection={self.is_complex_projection},
                 num_fourier_filters={self.num_fourier_filters},
                 num_orientations={self.num_orientations},
                 num_angular_components={self.num_angular_components},
@@ -141,6 +151,7 @@ class DecompositionResult:
             num_radial_components=self.num_radial_components,
             k_max=self.k_max,
             eig_max=self.eig_max,
+            is_complex_projection=self.is_complex_projection,
             created_at=self.created_at,
         )
 
@@ -171,10 +182,35 @@ class DecompositionResult:
             num_radial_components=int(data["num_radial_components"]),
             k_max=int(data["k_max"]),
             eig_max=int(data["eig_max"]),
+            is_complex_projection=bool(data["is_complex_projection"]),
             created_at=str(data["created_at"]),
         )
 
-    # @lru_cache(maxsize=32)  # often repeated queries
+    def k_to_stored(self, k_idx: int | np.ndarray) -> int | np.ndarray:
+        """Convert an angular-frequency index to its storage-array row index."""
+        if self.is_complex_projection:
+            return k_idx + self.k_max
+
+        # Since singular values are real-valued, complex conjugate returns same
+        return np.abs(k_idx) if isinstance(k_idx, np.ndarray) else abs(k_idx)
+
+    def is_conjugate_mode(self, k_idx: int | np.ndarray) -> bool | np.ndarray:
+        """Helper for determining when conj is needed across real/complex modes."""
+        # Always False for complex-valued decompositions
+        if self.is_complex_projection:
+            return (
+                np.zeros_like(k_idx, dtype=bool)
+                if isinstance(k_idx, np.ndarray)
+                else False
+            )
+
+        # True when k_idx is negative for real-valued decompositions
+        return (
+            (k_idx < 0)
+            if isinstance(k_idx, (int, np.integer))
+            else (np.asarray(k_idx) < 0)
+        )
+
     def get_top_n(self, top_k: int) -> np.ndarray:
         """Get the top-n singular values across all (frequency, radial) pairs."""
         if top_k not in self._top_n_cache:
@@ -182,6 +218,28 @@ class DecompositionResult:
             all_svs_sorted = np.argsort(np.abs(all_svs))[::-1]
             top_indices = all_svs_sorted[:top_k]
             k_indices, eig_indices = np.unravel_index(top_indices, self.S.shape)
+
+            # Handle real-valued decomposition case where must also include negative k
+            # indices for each positive k index
+            if not self.is_complex_projection:
+                tmp_k_indices = []
+                tmp_eig_indices = []
+
+                for k_idx, eig_idx in zip(k_indices, eig_indices, strict=False):
+                    if k_idx == 0:
+                        tmp_k_indices.append(k_idx)
+                        tmp_eig_indices.append(eig_idx)
+                    else:
+                        tmp_k_indices.extend([k_idx, -k_idx])
+                        tmp_eig_indices.extend([eig_idx, eig_idx])
+
+                    # Exit condition since could be 2x number of entries
+                    if len(tmp_k_indices) >= top_k:
+                        break
+
+                k_indices = np.array(tmp_k_indices)[:top_k]
+                eig_indices = np.array(tmp_eig_indices)[:top_k]
+
             self._top_n_cache[top_k] = np.stack((k_indices, eig_indices), axis=-1)
 
         return self._top_n_cache[top_k]
@@ -199,9 +257,11 @@ class DecompositionResult:
         Parameters
         ----------
         k_idx : int | np.ndarray
-            Angular frequency index or indices to retrieve.
+            Actual angular-frequency index or indices.  Valid range is
+            ``[0, k_max]`` for real-valued and ``[-k_max, k_max]`` for complex
+            decompositions.
         eig_idx : int | np.ndarray
-            Eigenvalue index or indices to retrieve.
+            Eigenvalue index or indices.
         return_u : bool, optional
             Whether to return the left singular vectors. Default is True.
         return_s : bool, optional
@@ -221,19 +281,27 @@ class DecompositionResult:
                 "At least one of return_u, return_s, return_vh must be True."
             )
 
-        k_idx = np.atleast_1d(k_idx)
+        k_idx_arr = np.atleast_1d(k_idx)
+        k_stored = np.atleast_1d(self.k_to_stored(k_idx_arr))
         eig_idx = np.atleast_1d(eig_idx)
+        conj_mask = np.atleast_1d(self.is_conjugate_mode(k_idx_arr))
 
         u = None
         s = None
         vh = None
 
         if return_u:
-            u = self.U[..., k_idx, eig_idx]
+            u = self.U[..., k_stored, eig_idx]
+            if conj_mask.any():
+                u = u.copy()
+                u[..., conj_mask] = u[..., conj_mask].conj()
         if return_s:
-            s = self.S[k_idx, eig_idx]
+            s = self.S[k_stored, eig_idx]
         if return_vh:
-            vh = self.Vh[k_idx, eig_idx]
+            vh = self.Vh[k_stored, eig_idx]
+            if conj_mask.any():
+                vh = vh.copy()
+                vh[conj_mask] = vh[conj_mask].conj()
 
         return u, s, vh
 
@@ -245,8 +313,9 @@ class DecompositionResult:
         Parameters
         ----------
         k_idx : int | None, optional
-            If specified, plot singular values for this specific angular frequency
-            index. If None, plot all singular values across all k indices, sorted by
+            Actual angular frequency to plot. Valid range is ``[0, k_max]``
+            for real-valued and ``[-k_max, k_max]`` for complex decompositions.
+            If None, plot all singular values across all frequencies, sorted by
             decreasing magnitude. Default is None.
         **kwargs : dict[str, Any]
             Additional keyword arguments to pass to plt.subplots()
@@ -257,7 +326,11 @@ class DecompositionResult:
             The matplotlib figure object and axes containing the scree plot.
         """
         fig, ax = plt.subplots(**kwargs)
-        svs = self.S[k_idx, :] if k_idx is not None else self.S.flatten()
+        svs = (
+            self.S[self.k_to_stored(k_idx), :]
+            if k_idx is not None
+            else self.S.flatten()
+        )
         title = (
             f"Scree Plot for k={k_idx}"
             if k_idx is not None
@@ -282,9 +355,9 @@ class DecompositionResult:
         Parameters
         ----------
         k_idx : int | None, optional
-            If specified, plot variance explained for this specific angular frequency
-            index. If None, plot for all singular values across all k indices.
-            Default is None.
+            Actual angular frequency to plot.  Valid range is ``[0, k_max]``
+            for real-valued and ``[-k_max, k_max]`` for complex decompositions.
+            If None, plot for all frequencies. Default is None.
         inverted : bool, optional
             If True, plot (1 - var exp) rather than (var exp). Default is True.
         **kwargs : dict[str, Any]
@@ -297,7 +370,11 @@ class DecompositionResult:
             plot.
         """
         fig, ax = plt.subplots(**kwargs)
-        svs = self.S[k_idx, :] if k_idx is not None else self.S.flatten()
+        svs = (
+            self.S[self.k_to_stored(k_idx), :]
+            if k_idx is not None
+            else self.S.flatten()
+        )
         title = (
             f"Cumulative Variance Explained for k={k_idx}"
             if k_idx is not None

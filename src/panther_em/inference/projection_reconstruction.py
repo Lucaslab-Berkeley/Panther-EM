@@ -38,7 +38,7 @@ class ProjectionReconstructor:
 
     def _resolve_num_components(self, num_components: int | None) -> int:
         """Parse possible 'None' value for num_components and enforce max limit."""
-        max_components = self.result.k_max * self.result.eig_max
+        max_components: int = self.result.S.shape[0] * self.result.eig_max
 
         if num_components is None:
             return max_components
@@ -46,8 +46,14 @@ class ProjectionReconstructor:
         return min(num_components, max_components)
 
     def _build_k_idx_groups(self, num_components: int) -> dict[int, list[int]]:
-        """Group eig_indices by their corresponding k_idx for the top-n components."""
-        groups: dict[int, list[int]] = {k: [] for k in range(self.result.k_max)}
+        """Group eig_indices by their angular-frequency k_idx for the top-n components.
+
+        Keys are actual angular frequencies:
+            - Real-valued decompositions: ``0 ... k_max``
+            - Complex decompositions:     ``-k_max ... k_max``
+        """
+        k_range = range(-self.result.k_max, self.result.k_max + 1)
+        groups: dict[int, list[int]] = {k: [] for k in k_range}
 
         for k_idx, eig_idx in self.result.get_top_n(num_components):
             groups[k_idx].append(eig_idx)
@@ -57,15 +63,16 @@ class ProjectionReconstructor:
     def _get_angular_phase_component(
         self, k_idx: int, phase_shift: float
     ) -> torch.Tensor:
-        """Private helper to compute phase component (circular modes).
+        """Compute the k-th discrete angular Fourier basis vector.
 
         Parameters
         ----------
         k_idx : int
-            Index of angular frequency component (circular mode).
+            Actual angular frequency.  Real-valued: ``[0, k_max]``;
+            complex: ``[-k_max, k_max]``.
         phase_shift : float
-            Phase shift to apply to the angular component, in degrees. Enables in-plane
-            rotation simulation.
+            Constant phase offset in degrees added to all angular positions.
+            Used to analytically apply in-plane rotation.
         """
         phase_shift_rad = np.deg2rad(phase_shift)
 
@@ -84,7 +91,8 @@ class ProjectionReconstructor:
         Parameters
         ----------
         k_idx : int
-            Angular frequency index.
+            Actual angular frequency.  Real-valued: ``[0, k_max]``;
+            complex: ``[-k_max, k_max]``.
         phase_shifts : torch.Tensor
             Phase shifts in degrees, shape (B,).
 
@@ -114,7 +122,8 @@ class ProjectionReconstructor:
         Parameters
         ----------
         k_idx : int
-            Index of the angular component (circular mode).
+            Actual angular frequency.  Real-valued: ``[0, k_max]``;
+            complex: ``[-k_max, k_max]``.
         eig_idx : int
             Index of the radial eigenvector (component).
         in_plane_rotation : float, optional
@@ -130,7 +139,13 @@ class ProjectionReconstructor:
             (num_angular_components, num_radial_components).
         """
         angular_component = self._get_angular_phase_component(k_idx, in_plane_rotation)
-        v_tensor = self._Vh[k_idx, eig_idx]
+        k_stored = self.result.k_to_stored(k_idx)
+        v_tensor = self._Vh[k_stored, eig_idx]
+
+        # Case of real-value and negative k_idx
+        if self.result.is_conjugate_mode(k_idx):
+            v_tensor = v_tensor.conj()
+
         polar_feature = torch.outer(angular_component, v_tensor)
 
         return polar_feature if return_torch else polar_feature.cpu().numpy()
@@ -275,16 +290,22 @@ class ProjectionReconstructor:
             device=self.device,
         )
 
+        N = self.result.num_angular_components
+
         for k_idx, eig_indices in sorted(k_idx_groups.items()):
             # If no components to process
             if not eig_indices:
                 continue
 
             eig_idx_tensor = torch.tensor(eig_indices, device=self.device)
+            # k_idx is the actual angular frequency; convert to storage row.
+            k_stored = self.result.k_to_stored(k_idx)
 
-            u_ki = self._U[fourier_filter_idx, orientation_idx, k_idx, eig_idx_tensor]
-            s_k = self._S[k_idx, eig_idx_tensor]
-            vh_k = self._Vh[k_idx, eig_idx_tensor]
+            u_ki = self._U[
+                fourier_filter_idx, orientation_idx, k_stored, eig_idx_tensor
+            ]
+            s_k = self._S[k_stored, eig_idx_tensor]
+            vh_k = self._Vh[k_stored, eig_idx_tensor]
 
             # Mathematical reconstruction: U_ki * S_k * Vh_k
             weighted_features = u_ki * s_k
@@ -295,6 +316,16 @@ class ProjectionReconstructor:
             )
 
             polar_projection += torch.outer(angular_component, radial_contribution)
+
+            # For real-valued decompositions the -k block equals conj(+k block).
+            # DC (k=0) and Nyquist are self-conjugate; all other stored positive
+            # modes must contribute their -k mirror.
+            if not self.result.is_complex_projection and k_idx > 0:
+                is_nyquist = (N % 2 == 0) and (k_idx == N // 2)
+                if not is_nyquist:
+                    polar_projection += torch.outer(
+                        angular_component.conj(), radial_contribution.conj()
+                    )
 
         if return_polar:
             return polar_projection if return_torch else polar_projection.cpu().numpy()
@@ -391,12 +422,16 @@ class ProjectionReconstructor:
             device=self.device,
         )
 
+        N = self.result.num_angular_components
+
         for k_idx in sorted(k_idx_groups.keys()):
             eig_indices = k_idx_groups[k_idx]
             if not eig_indices:
                 continue
 
             eig_idx_tensor = torch.tensor(eig_indices, device=self.device)
+            # k_idx is the actual angular frequency; convert to storage row.
+            k_stored = self.result.k_to_stored(k_idx)
 
             # angular_batch: (B, A)
             angular_batch = self._get_angular_phase_components_batch(
@@ -405,13 +440,24 @@ class ProjectionReconstructor:
 
             # u_batch: (B, E) via broadcast indexing over orientation and ff axes
             u_batch = self._U[
-                ff_batch[:, None], orient_batch[:, None], k_idx, eig_idx_tensor[None, :]
+                ff_batch[:, None],
+                orient_batch[:, None],
+                k_stored,
+                eig_idx_tensor[None, :],
             ]
-            s_k = self._S[k_idx, eig_idx_tensor]  # (E,)
-            vh_k = self._Vh[k_idx, eig_idx_tensor]  # (E, R)
+            s_k = self._S[k_stored, eig_idx_tensor]  # (E,)
+            vh_k = self._Vh[k_stored, eig_idx_tensor]  # (E, R)
 
             radial = (u_batch * s_k[None, :]) @ vh_k  # (B, R)
             polar_projections += angular_batch[:, :, None] * radial[:, None, :]
+
+            # For real-valued decompositions the -k block equals conj(+k block).
+            if not self.result.is_complex_projection and k_idx > 0:
+                is_nyquist = (N % 2 == 0) and (k_idx == N // 2)
+                if not is_nyquist:
+                    polar_projections += (
+                        angular_batch.conj()[:, :, None] * radial.conj()[:, None, :]
+                    )
 
         if return_polar:
             return (
