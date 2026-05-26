@@ -33,6 +33,7 @@ from panther_em.utils.warp_transforms import OffsetPolarTransform
 def precompute_volume_dft(
     volume: torch.Tensor,
     pad_factor: float = 2.0,
+    zero_background: bool = True,
 ) -> tuple[torch.Tensor, float, int]:
     """Precompute the 3D RFFT of a volume with padding.
 
@@ -42,6 +43,9 @@ def precompute_volume_dft(
         `(d, d, d)` cubic volume.
     pad_factor : float
         Padding factor for the volume. Default is 2.0.
+    zero_background : bool
+        When True, zero out the background by subtracting an average edge value from
+        the volume.
 
     Returns
     -------
@@ -53,11 +57,15 @@ def precompute_volume_dft(
         Number of pixels padded on each side (0 if pad_factor <= 1.0).
     """
     d = volume.shape[-1]
+    edge_value = compute_cube_face_averages(volume, n=4)
+
+    if zero_background:
+        volume = volume - edge_value
+        edge_value = 0.0  # for pad_factor case
 
     pad_width = 0
     if pad_factor > 1.0:
         pad_width = int((d * (pad_factor - 1.0)) // 2)
-        edge_value = compute_cube_face_averages(volume, n=4)
         volume = F.pad(volume, pad=[pad_width] * 6, mode="constant", value=edge_value)
 
     volume_mean_scaled = volume.mean() * d
@@ -310,10 +318,13 @@ def do_pipelined_projection_and_transforms(
     # TODO: check input shapes/types
 
     if fourier_filters is None:
+        filter_shape = (
+            (1, volume.shape[1], volume.shape[2])
+            if torch.is_complex(volume)
+            else (1, volume.shape[1], volume.shape[2] // 2 + 1)
+        )
         fourier_filters = torch.ones(
-            (1, volume.shape[1], volume.shape[2] // 2 + 1),
-            device=volume.device,
-            dtype=torch.complex64,
+            filter_shape, device=volume.device, dtype=torch.complex64
         )
 
     # Precompute the 3D RFFT once — stays on GPU for the entire pipeline

@@ -298,7 +298,7 @@ class PolarProjectionDecomposer:
             is_complex_projection=is_complex,
             num_fourier_filters=batch_shape[0],
             num_orientations=batch_shape[1],
-            num_angular_components=num_angular_mode,
+            num_angular_components=self.num_angle,
             num_radial_components=num_radius,
         )
 

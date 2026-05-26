@@ -55,7 +55,10 @@ class ProjectionReconstructor:
         k_range = range(-self.result.k_max, self.result.k_max + 1)
         groups: dict[int, list[int]] = {k: [] for k in k_range}
 
-        for k_idx, eig_idx in self.result.get_top_n(num_components):
+        for k_idx, eig_idx in self.result.get_top_n(
+            num_components,
+            include_negative=False,  # NOTE: leveraging conj symmetry
+        ):
             groups[k_idx].append(eig_idx)
 
         return groups

@@ -80,7 +80,10 @@ class DecompositionResult:
 
     def __post_init__(self) -> None:
         """Validate shapes after initialization."""
-        num_freq_blocks = self.k_max * 2 if self.is_complex_projection else self.k_max
+        if self.is_complex_projection:
+            num_freq_blocks = self.k_max * 2  # NOTE: need plus 1?
+        else:
+            num_freq_blocks = self.k_max  # NOTE: need plus 1?
 
         expected_U_shape = (
             self.num_fourier_filters,
@@ -109,7 +112,7 @@ class DecompositionResult:
             )
 
         # Per-instance cache for top-n queries
-        self._top_n_cache: dict[int, np.ndarray] = {}
+        self._top_n_cache: dict[tuple[int, bool], np.ndarray] = {}
 
     def __repr__(self) -> str:
         """String representation of the DecompositionResult."""
@@ -211,9 +214,27 @@ class DecompositionResult:
             else (np.asarray(k_idx) < 0)
         )
 
-    def get_top_n(self, top_k: int) -> np.ndarray:
-        """Get the top-n singular values across all (frequency, radial) pairs."""
-        if top_k not in self._top_n_cache:
+    def get_top_n(self, top_k: int, include_negative: bool = True) -> np.ndarray:
+        """Get the top-n singular values across all (frequency, radial) pairs.
+
+        Parameters
+        ----------
+        top_k : int
+            The number of top singular values to retrieve.
+        include_negative : bool, optional
+            If this is a real-valued decomposition, this flag chooses whether to include
+            negative frequency indices (default True) or to only include non-negative
+            angular frequencies (False). No effect when is_complex_projection is True.
+
+        Returns
+        -------
+        np.ndarray
+            An array of shape (l, 2) where l <= top_k containing the (k_idx, eig_idx)
+            pairs corresponding to the top singular values sorted by decreasing
+            magnitude.
+        """
+        cache_key = (top_k, include_negative)
+        if cache_key not in self._top_n_cache:
             all_svs = self.S.flatten()
             all_svs_sorted = np.argsort(np.abs(all_svs))[::-1]
             top_indices = all_svs_sorted[:top_k]
@@ -221,7 +242,7 @@ class DecompositionResult:
 
             # Handle real-valued decomposition case where must also include negative k
             # indices for each positive k index
-            if not self.is_complex_projection:
+            if not self.is_complex_projection and include_negative:
                 tmp_k_indices = []
                 tmp_eig_indices = []
 
@@ -240,9 +261,9 @@ class DecompositionResult:
                 k_indices = np.array(tmp_k_indices)[:top_k]
                 eig_indices = np.array(tmp_eig_indices)[:top_k]
 
-            self._top_n_cache[top_k] = np.stack((k_indices, eig_indices), axis=-1)
+            self._top_n_cache[cache_key] = np.stack((k_indices, eig_indices), axis=-1)
 
-        return self._top_n_cache[top_k]
+        return self._top_n_cache[cache_key]
 
     def get_component(
         self,
