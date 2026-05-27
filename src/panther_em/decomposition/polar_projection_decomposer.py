@@ -89,6 +89,9 @@ class PolarProjectionDecomposer:
         if isinstance(theta_values, np.ndarray):
             theta_values = torch.from_numpy(theta_values.copy())
 
+        if isinstance(fourier_filters, np.ndarray):
+            fourier_filters = torch.from_numpy(fourier_filters.copy())
+
         # Send to the target device
         self.volume = volume.to(self.device)
         self.phi_values = phi_values.to(self.device)
@@ -289,6 +292,11 @@ class PolarProjectionDecomposer:
             Vh[k_indices, :, :] = vh.cpu()
 
         # Convert results back to numpy for storage
+        fourier_filters_np = (
+            self.fourier_filters.cpu().numpy()
+            if self.fourier_filters is not None
+            else None
+        )
         self._result = DecompositionResult(
             S=S.cpu().numpy().astype(np.float32),
             U=U.cpu().numpy(),
@@ -300,6 +308,9 @@ class PolarProjectionDecomposer:
             num_orientations=batch_shape[1],
             num_angular_components=self.num_angle,
             num_radial_components=num_radius,
+            phi_values=self.phi_values.cpu().numpy(),
+            theta_values=self.theta_values.cpu().numpy(),
+            fourier_filters=fourier_filters_np,
         )
 
         return self._result

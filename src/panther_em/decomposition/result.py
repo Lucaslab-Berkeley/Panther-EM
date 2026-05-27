@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -34,6 +35,9 @@ class DecompositionResult:
     singular value magnitude; similar methods exist for retrieving the corresponding
     singular vectors and values.
 
+    Results are saved and loaded as HDF5 files (``.h5`` / ``.hdf5``) via
+    :meth:`save` and :meth:`load`.
+
     Attributes
     ----------
     U : np.ndarray
@@ -55,8 +59,21 @@ class DecompositionResult:
         eigenvectors stored per angular frequency component
     k_max : int
         Maximum angular frequency index used.
+    eig_max : int
+        Maximum radial eigenvalue index used.
+    is_complex_projection : bool
+        Whether the underlying projection data is complex-valued.
     created_at : str
         ISO format timestamp of when the result was created.
+    phi_values : np.ndarray | None
+        Phi (azimuthal) ZYZ Euler angles in degrees used during decomposition, shape
+        ``(num_orientations,)``. ``None`` if not recorded.
+    theta_values : np.ndarray | None
+        Theta (polar) ZYZ Euler angles in degrees used during decomposition, shape
+        ``(num_orientations,)``. ``None`` if not recorded.
+    fourier_filters : np.ndarray | None
+        Fourier-space filters (e.g. CTF envelopes) applied during decomposition, shape
+        ``(num_fourier_filters, ...)``. ``None`` if no filters were applied.
     """
 
     # Core SVD components
@@ -77,6 +94,13 @@ class DecompositionResult:
 
     # Timestamp
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+
+    # Optional orientation recorded at decomposition time
+    phi_values: np.ndarray | None = None
+    theta_values: np.ndarray | None = None
+
+    # Optional Fourier filters recorded at decomposition time
+    fourier_filters: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         """Validate shapes after initialization."""
@@ -111,6 +135,29 @@ class DecompositionResult:
                 f"Vh shape {self.Vh.shape} does not match expected {expected_Vh_shape}"
             )
 
+        # Validate optional angle arrays
+        if self.phi_values is not None:
+            if self.phi_values.shape != (self.num_orientations,):
+                raise ValueError(
+                    f"phi_values shape {self.phi_values.shape} does not match "
+                    f"expected ({self.num_orientations},)"
+                )
+        if self.theta_values is not None:
+            if self.theta_values.shape != (self.num_orientations,):
+                raise ValueError(
+                    f"theta_values shape {self.theta_values.shape} does not match "
+                    f"expected ({self.num_orientations},)"
+                )
+
+        # Validate optional Fourier filters
+        if self.fourier_filters is not None:
+            if self.fourier_filters.shape[0] != self.num_fourier_filters:
+                raise ValueError(
+                    f"fourier_filters leading dimension "
+                    f"{self.fourier_filters.shape[0]} does not match "
+                    f"num_fourier_filters={self.num_fourier_filters}"
+                )
+
         # Per-instance cache for top-n queries
         self._top_n_cache: dict[tuple[int, bool], np.ndarray] = {}
 
@@ -125,69 +172,221 @@ class DecompositionResult:
                 num_orientations={self.num_orientations},
                 num_angular_components={self.num_angular_components},
                 num_radial_components={self.num_radial_components},
+                has_euler_angles={self.phi_values is not None},
+                has_fourier_filters={self.fourier_filters is not None},
                 created_at='{self.created_at}'
             )
             """)
 
         return s.strip()
 
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def _write_hdf5_metadata(self, f: h5py.File) -> None:
+        """Write scalar metadata as root-level HDF5 attributes."""
+        f.attrs["k_max"] = self.k_max
+        f.attrs["eig_max"] = self.eig_max
+        f.attrs["is_complex_projection"] = self.is_complex_projection
+        f.attrs["num_fourier_filters"] = self.num_fourier_filters
+        f.attrs["num_orientations"] = self.num_orientations
+        f.attrs["num_angular_components"] = self.num_angular_components
+        f.attrs["num_radial_components"] = self.num_radial_components
+        f.attrs["created_at"] = self.created_at
+
+    def _write_hdf5_optional_arrays(self, f: h5py.File) -> None:
+        """Write optional orientation angles and Fourier filters if present."""
+        if self.phi_values is not None:
+            f.create_dataset("phi_values", data=self.phi_values)
+        if self.theta_values is not None:
+            f.create_dataset("theta_values", data=self.theta_values)
+        if self.fourier_filters is not None:
+            f.create_dataset("fourier_filters", data=self.fourier_filters)
+
     def save(self, path: str | Path) -> None:
-        """Save decomposition result to disk.
+        """Save the full decomposition result to an HDF5 file.
+
+        Scalar metadata is stored as root-level HDF5 attributes.  To save only
+        the most significant components and reduce file size, use
+        :meth:`save_top_n` instead.
 
         Parameters
         ----------
         path : str | Path
-            Path to save the result. Will be saved as .npz file.
+            Destination path.  The extension is replaced with ``.h5`` if it
+            is not already ``.h5`` or ``.hdf5``.
         """
         path = Path(path)
-        if path.suffix != ".npz":
-            path = path.with_suffix(".npz")
+        if path.suffix not in {".h5", ".hdf5"}:
+            path = path.with_suffix(".h5")
 
-        np.savez_compressed(
-            path,
-            S=self.S,
-            U=self.U,
-            Vh=self.Vh,
-            num_fourier_filters=self.num_fourier_filters,
-            num_orientations=self.num_orientations,
-            num_angular_components=self.num_angular_components,
-            num_radial_components=self.num_radial_components,
-            k_max=self.k_max,
-            eig_max=self.eig_max,
-            is_complex_projection=self.is_complex_projection,
-            created_at=self.created_at,
-        )
+        with h5py.File(path, "w") as f:
+            self._write_hdf5_metadata(f)
+            f.create_dataset("U", data=self.U)
+            f.create_dataset("S", data=self.S)
+            f.create_dataset("Vh", data=self.Vh)
+            self._write_hdf5_optional_arrays(f)
+
+    def save_top_n(self, path: str | Path, top_k: int) -> None:
+        r"""Save only the ``top_k`` most significant components to HDF5.
+
+        Selects the ``top_k`` unique ``(k_stored, eig_idx)`` pairs ranked by
+        ``|S|`` and writes only the corresponding slices of ``U``, ``S``, and
+        ``Vh``.  The file is tagged ``is_sparse=True`` so :meth:`load`
+        transparently reconstructs full-shape zero-padded arrays, leaving all
+        downstream code (``get_top_n``, ``get_component``, ``compute_weights``,
+        etc.) unchanged.
+
+        File size is :math:`O(top\\_k)` rather than :math:`O(k\\_max \\times
+        eig\\_max)`.
+
+        Parameters
+        ----------
+        path : str | Path
+            Destination path.  Extension is normalized to ``.h5``.
+        top_k : int
+            Number of unique ``(k_stored, eig_idx)`` pairs to store.
+
+        Raises
+        ------
+        ValueError
+            If ``top_k < 1``.
+        """
+        if top_k < 1:
+            raise ValueError(f"top_k must be >= 1, got {top_k}")
+
+        path = Path(path)
+        if path.suffix not in {".h5", ".hdf5"}:
+            path = path.with_suffix(".h5")
+
+        # include_negative=False gives unique stored pairs (no double-counting
+        # for real decompositions where ±k share the same stored row)
+        pairs = self.get_top_n(top_k, include_negative=False)
+        pairs = pairs[:top_k]
+
+        k_stored_arr = pairs[:, 0].astype(int)
+        eig_idx_arr = pairs[:, 1].astype(int)
+
+        # Compact slices — shapes (num_ff, num_or, L), (L,), (L, num_r)
+        U_sparse = self.U[..., k_stored_arr, eig_idx_arr]
+        S_sparse = self.S[k_stored_arr, eig_idx_arr]
+        Vh_sparse = self.Vh[k_stored_arr, eig_idx_arr, :]
+        selected_indices = np.stack([k_stored_arr, eig_idx_arr], axis=1)
+
+        with h5py.File(path, "w") as f:
+            f.attrs["is_sparse"] = True
+            self._write_hdf5_metadata(f)
+            f.create_dataset("selected_indices", data=selected_indices)
+            f.create_dataset("U", data=U_sparse)
+            f.create_dataset("S", data=S_sparse)
+            f.create_dataset("Vh", data=Vh_sparse)
+            self._write_hdf5_optional_arrays(f)
 
     @classmethod
     def load(cls, path: str | Path) -> "DecompositionResult":
-        """Load decomposition result from disk.
+        """Load a decomposition result from an HDF5 file written by :meth:`save`.
 
         Parameters
         ----------
         path : str | Path
-            Path to the saved .npz file.
+            Path to the ``.h5`` or ``.hdf5`` file.
 
         Returns
         -------
         DecompositionResult
             The loaded decomposition result.
+
+        Raises
+        ------
+        ValueError
+            If the file extension is not ``.h5`` or ``.hdf5``.
         """
         path = Path(path)
-        data = np.load(path, allow_pickle=False)
+        if path.suffix not in {".h5", ".hdf5"}:
+            raise ValueError(
+                f"Unknown file extension '{path.suffix}'. Expected '.h5' or '.hdf5'."
+            )
+        return cls._load_hdf5(path)
 
-        return cls(
-            S=data["S"],
-            U=data["U"],
-            Vh=data["Vh"],
-            num_fourier_filters=int(data["num_fourier_filters"]),
-            num_orientations=int(data["num_orientations"]),
-            num_angular_components=int(data["num_angular_components"]),
-            num_radial_components=int(data["num_radial_components"]),
-            k_max=int(data["k_max"]),
-            eig_max=int(data["eig_max"]),
-            is_complex_projection=bool(data["is_complex_projection"]),
-            created_at=str(data["created_at"]),
-        )
+    @classmethod
+    def _load_hdf5(cls, path: Path) -> "DecompositionResult":
+        """Load from an HDF5 file produced by :meth:`save` or :meth:`save_top_n`.
+
+        When the file was written by :meth:`save_top_n` (``is_sparse=True``
+        attribute present), the compact sparse arrays are scattered back into
+        full zero-padded dense arrays so that all downstream indexing code works
+        without modification.
+        """
+        with h5py.File(path, "r") as f:
+            is_sparse = bool(f.attrs.get("is_sparse", False))
+
+            k_max = int(f.attrs["k_max"])
+            eig_max = int(f.attrs["eig_max"])
+            is_complex = bool(f.attrs["is_complex_projection"])
+            num_ff = int(f.attrs["num_fourier_filters"])
+            num_or = int(f.attrs["num_orientations"])
+            num_ang = int(f.attrs["num_angular_components"])
+            num_r = int(f.attrs["num_radial_components"])
+
+            # h5py >= 3 returns str; older versions may return bytes
+            created_at = f.attrs["created_at"]
+            if isinstance(created_at, bytes):
+                created_at = created_at.decode("utf-8")
+
+            phi_values = f["phi_values"][()] if "phi_values" in f else None
+            theta_values = f["theta_values"][()] if "theta_values" in f else None
+            fourier_filters = (
+                f["fourier_filters"][()] if "fourier_filters" in f else None
+            )
+
+            if is_sparse:
+                # Scatter compact arrays into zero-filled dense arrays so that
+                # all existing indexing (get_top_n, get_component, compute_weights)
+                # works without any downstream changes.
+                num_freq_blocks = k_max * 2 if is_complex else k_max
+                selected_indices = f["selected_indices"][()]  # (L, 2)
+                U_sparse = f["U"][()]  # (num_ff, num_or, L)
+                S_sparse = f["S"][()]  # (L,)
+                Vh_sparse = f["Vh"][()]  # (L, num_r)
+
+                k_stored_arr = selected_indices[:, 0]
+                eig_idx_arr = selected_indices[:, 1]
+
+                U = np.zeros(
+                    (num_ff, num_or, num_freq_blocks, eig_max), dtype=np.complex64
+                )
+                S = np.zeros((num_freq_blocks, eig_max), dtype=np.float32)
+                Vh = np.zeros((num_freq_blocks, eig_max, num_r), dtype=np.complex64)
+
+                U[..., k_stored_arr, eig_idx_arr] = U_sparse
+                S[k_stored_arr, eig_idx_arr] = S_sparse
+                Vh[k_stored_arr, eig_idx_arr, :] = Vh_sparse
+            else:
+                U = f["U"][()]
+                S = f["S"][()]
+                Vh = f["Vh"][()]
+
+            return cls(
+                U=U,
+                S=S,
+                Vh=Vh,
+                k_max=k_max,
+                eig_max=eig_max,
+                is_complex_projection=is_complex,
+                num_fourier_filters=num_ff,
+                num_orientations=num_or,
+                num_angular_components=num_ang,
+                num_radial_components=num_r,
+                created_at=created_at,
+                phi_values=phi_values,
+                theta_values=theta_values,
+                fourier_filters=fourier_filters,
+            )
+
+    # ------------------------------------------------------------------
+    # Index helpers
+    # ------------------------------------------------------------------
 
     def k_to_stored(self, k_idx: int | np.ndarray) -> int | np.ndarray:
         """Convert an angular-frequency index to its storage-array row index."""
@@ -325,6 +524,10 @@ class DecompositionResult:
                 vh[conj_mask] = vh[conj_mask].conj()
 
         return u, s, vh
+
+    # ------------------------------------------------------------------
+    # Plotting helpers
+    # ------------------------------------------------------------------
 
     def scree_plot(
         self, k_idx: int | None = None, **kwargs: dict[str, Any]
