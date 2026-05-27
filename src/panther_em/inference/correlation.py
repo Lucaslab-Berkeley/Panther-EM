@@ -143,39 +143,58 @@ def compute_feature_stack(
 
 
 def compute_weights(result: DecompositionResult, indices: torch.Tensor) -> torch.Tensor:
-    """Extract weights `W[ff, orient, n] = U[ff, orient, k, eig] * S[k, eig]`.
+    """Extract weights ``W[ff, orient, n] = U[ff, orient, k, eig] * S[k, eig]``.
 
     Parameters
     ----------
     result : DecompositionResult
-        Source of singular values `S` (float32) and left singular vectors `U`
+        Source of singular values ``S`` (float32) and left singular vectors ``U``
         (complex64).
     indices : torch.Tensor
-        `(N, 2)` integer tensor of `[k_idx, eig_idx]` pairs. Note the device of
-        this tensor controls the device of the returned weights.
+        ``(N, 2)`` integer tensor of ``[k_idx, eig_idx]`` pairs where ``k_idx``
+        is the actual angular frequency (``[0, k_max]`` for real-valued,
+        ``[-k_max, k_max]`` for complex). The device of this tensor controls
+        the device of the returned weights.
 
     Returns
     -------
     torch.Tensor
-        Complex64 tensor of shape `(num_fourier_filters, num_orientations, N)`.
+        Complex64 tensor of shape ``(num_fourier_filters, num_orientations, N)``.
     """
     device = indices.device
 
     U = torch.from_numpy(result.U)
     S = torch.from_numpy(result.S)
-    S = torch.sqrt(S)
 
-    # Send to devices and ensure correct dtype
-    U = U.to(dtype=torch.complex64, device=device)  # (FF, O, k_max, eig_max)
-    S = S.to(dtype=torch.complex64, device=device)  # (k_max, eig_max)
+    # Send to device and ensure correct dtype
+    U = U.to(dtype=torch.complex64, device=device)  # (FF, O, num_blocks, eig_max)
+    S = S.to(dtype=torch.complex64, device=device)  # (num_blocks, eig_max)
 
-    k_idx = indices[:, 0]  # (L,)
+    k_freq = indices[:, 0]  # (L,) — actual angular frequencies
     eig_idx = indices[:, 1]  # (L,)
 
-    U_selected = U[:, :, k_idx, eig_idx]  # (FF, O, L)
-    S_selected = S[k_idx, eig_idx]  # (L,)
+    # Convert angular frequencies to storage-array row indices.
+    # Complex: stored_index = k_freq + k_max (fftshifted layout).
+    # Real:    stored_index = abs(k_freq) (negative freqs are conjugate of positive).
+    if result.is_complex_projection:
+        k_stored = k_freq + result.k_max
+    else:
+        k_stored = k_freq.abs()
 
-    return U_selected * S_selected
+    U_selected = U[:, :, k_stored, eig_idx]  # (FF, O, L)
+    S_selected = S[k_stored, eig_idx]  # (L,)
+
+    weights = U_selected * S_selected
+
+    # For real-valued decompositions U[-k] = conj(U[k]).
+    # Conjugate the weights for any negative-frequency component.
+    if not result.is_complex_projection:
+        neg_mask = k_freq < 0
+        if neg_mask.any():
+            weights = weights.clone()
+            weights[:, :, neg_mask] = weights[:, :, neg_mask].conj()
+
+    return weights
 
 
 def contract_features(weights: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
@@ -298,19 +317,21 @@ def compute_correlogram(
 
     _has_batch = image.dim() == 4
     B = image.shape[0] if _has_batch else None
-    FF, _O = result.num_fourier_filters, result.num_orientations
-    out_shape = (B, FF, O, out_H, out_W) if _has_batch else (FF, O, out_H, out_W)
+    FF, OR = result.num_fourier_filters, result.num_orientations
+    out_shape = (B, FF, OR, out_H, out_W) if _has_batch else (FF, OR, out_H, out_W)
 
     accumulator = torch.zeros(out_shape, dtype=torch.complex64, device=device)
     image = image.to(device)
 
     # --- Stage 1: select (k_idx, eig_idx) pairs ----------------------------
+    # Mirror reconstruct_projection: use only non-negative k for real-valued
+    # decompositions; the -k mirror is added explicitly below via conjugate.
     if k_indices is None and eig_indices is None:
         if top_k is None:
             raise ValueError(
                 "Must provide either 'top_k' or both 'k_indices' and 'eig_indices'."
             )
-        top_k_indices = result.get_top_n(top_k=top_k)
+        top_k_indices = result.get_top_n(top_k=top_k, include_negative=False)
         top_k_indices = torch.from_numpy(top_k_indices).to(device)
     else:
         if k_indices is None or eig_indices is None:
@@ -326,6 +347,12 @@ def compute_correlogram(
             "No (k_idx, eig_idx) pairs were selected; cannot compute correlogram."
         )
 
+    # For real-valued: identify which components need a -k mirror contribution
+    # (everything except DC and, for even N, the Nyquist bin).
+    is_real = not result.is_complex_projection
+    N_angle = result.num_angular_components
+    nyquist_k = N_angle // 2 if (N_angle % 2 == 0) else None
+
     # --- Stages 2 & 3: build kernels, correlate, contract (optionally chunked)
     effective_chunk = chunk_size if chunk_size is not None else N
 
@@ -336,7 +363,22 @@ def compute_correlogram(
         F_chunk = compute_feature_stack(image, kernels)
         W_chunk = compute_weights(result, chunk_indices)
 
-        accumulator = accumulator + contract_features(W_chunk, F_chunk)
+        # Cross-correlation is conjugate-linear in the kernel:
+        # I * (aK) = conj(a)F where F = X * K
+        # such that X * sum_l W_l K_l = sum_l conj(W_l) F_l
+        # hence conjugation on the weights matrix
+        W_chunk_conj = W_chunk.conj()
+        accumulator = accumulator + contract_features(W_chunk_conj, F_chunk)
+
+        # For real-valued, add the -k mirror contribution.
+        if is_real:
+            k_freqs = chunk_indices[:, 0]
+            mirror_mask = k_freqs > 0
+            if nyquist_k is not None:
+                mirror_mask = mirror_mask & (k_freqs != nyquist_k)
+            if mirror_mask.any():
+                W_mirror = W_chunk_conj * mirror_mask.to(dtype=W_chunk.dtype)
+                accumulator = accumulator + contract_features(W_mirror, F_chunk).conj()
 
     return accumulator
 
@@ -395,12 +437,12 @@ def estimate_memory_bytes(
     H, W = image_shape[-2], image_shape[-1]
     B = image_shape[0] if len(image_shape) == 4 else 1
     FF = result.num_fourier_filters
-    _O = result.num_orientations
+    OR = result.num_orientations
 
     kernel_bytes = chunk * kH * kW * bpe  # (chunk, kH, kW)
     feature_bytes = B * chunk * H * W * bpe  # (B, chunk, H, W)
-    weight_bytes = FF * O * chunk * bpe  # (FF, O, chunk)
-    acc_bytes = B * FF * O * H * W * bpe  # (B, FF, O, H, W)
+    weight_bytes = FF * OR * chunk * bpe  # (FF, O, chunk)
+    acc_bytes = B * FF * OR * H * W * bpe  # (B, FF, O, H, W)
     total = kernel_bytes + feature_bytes + weight_bytes + acc_bytes
 
     return {
