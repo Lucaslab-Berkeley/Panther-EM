@@ -1,10 +1,8 @@
 """Pipelined generation and transforms of projections in polar coordinates.
 
-For the on-the-fly projection generation, groups of projections can be generated and
-transformed together in batches on the GPU to not exceed GPU memory limits. Data for the
-SVD step are generally too large to fit into GPU memory, so after each batch execution
-data is moved back to CPU and stored. Retains GPU acceleration for many parallelizable
-steps.
+For the on-the-fly projection generation, groups of projections (row elements) can be
+generated and transformed independently before the SVD stage. This module defines the
+pipeline for this stage of computation:
 
 1. Transform batch of (B, 3) ZYZ Euler angles (phi, theta, psi) into rotation matrices.
 2. Take Fourier slices from a RFFT'd 3D volume using the rotation matrices. Produces
@@ -14,8 +12,9 @@ steps.
 4. Inverse FFT into set of (f, B, h, w) CTF convolved cartesian-space projections.
 5. Warp cartesian-space projections in the batch into polar coordinates, producing
    (f, B, num_angle, num_radius) polar projections.
-6. Complex FFT along the angular dimension (axis=-2) to get
-   (f, B, num_angle, num_radius) angular-frequency-space polar projections.
+6. Fourier transform along the angular dimension (axis=-2) to get
+   (f, B, num_angular_mode, num_radius) angular-frequency-space polar projections.
+   NOTE: If projections are real-valued, can leverage RFFT here.
 7. Move batch of angular-frequency-space polar projections to CPU for further processing
    in the SVD pipeline.
 8. Repeat for next batch until all projections are processed.
@@ -34,6 +33,7 @@ from panther_em.utils.warp_transforms import OffsetPolarTransform
 def precompute_volume_dft(
     volume: torch.Tensor,
     pad_factor: float = 2.0,
+    zero_background: bool = True,
 ) -> tuple[torch.Tensor, float, int]:
     """Precompute the 3D RFFT of a volume with padding.
 
@@ -43,6 +43,9 @@ def precompute_volume_dft(
         `(d, d, d)` cubic volume.
     pad_factor : float
         Padding factor for the volume. Default is 2.0.
+    zero_background : bool
+        When True, zero out the background by subtracting an average edge value from
+        the volume.
 
     Returns
     -------
@@ -54,11 +57,15 @@ def precompute_volume_dft(
         Number of pixels padded on each side (0 if pad_factor <= 1.0).
     """
     d = volume.shape[-1]
+    edge_value = compute_cube_face_averages(volume, n=4)
+
+    if zero_background:
+        volume = volume - edge_value
+        edge_value = 0.0  # for pad_factor case
 
     pad_width = 0
     if pad_factor > 1.0:
         pad_width = int((d * (pad_factor - 1.0)) // 2)
-        edge_value = compute_cube_face_averages(volume, n=4)
         volume = F.pad(volume, pad=[pad_width] * 6, mode="constant", value=edge_value)
 
     volume_mean_scaled = volume.mean() * d
@@ -118,6 +125,7 @@ def project_from_precomputed_dft(
     if pad_width > 0:
         projections = F.pad(projections, pad=[-pad_width] * 4)
 
+    # TEST: Try keeping zero-mean projections
     # Add back the mean
     projections += volume_mean_scaled
 
@@ -147,13 +155,23 @@ def generate_projection_batch(
 
 def apply_fourier_filters(
     projections: torch.Tensor,  # (B, h, w)
-    fourier_filters: torch.Tensor,  # (f, h, w // 2 + 1)
+    fourier_filters: torch.Tensor,  # (f, h, w // 2 + 1) OR (f, h, w)
 ) -> torch.Tensor:  # (f, B, h, w)
     """Apply pre-calculated Fourier filters to a batch of real-space projections."""
-    projections_fft = torch.fft.rfft2(projections)
-    projections_fft = projections_fft[None, ...] * fourier_filters[:, None, :, :]
+    _is_complex = (
+        torch.is_complex(projections)
+        or fourier_filters.shape[-2] == fourier_filters.shape[-1]  # not rfft'd
+    )
 
-    return torch.fft.irfft2(projections_fft)
+    # Pathing for complex vs real valued resultant projections
+    if _is_complex:
+        projections_fft = torch.fft.fft2(projections)
+        projections_fft = projections_fft[None, ...] * fourier_filters[:, None, :, :]
+        return torch.fft.ifft2(projections_fft)
+    else:
+        projections_fft = torch.fft.rfft2(projections)
+        projections_fft = projections_fft[None, ...] * fourier_filters[:, None, :, :]
+        return torch.fft.irfft2(projections_fft)
 
 
 def process_batch(
@@ -167,8 +185,42 @@ def process_batch(
     transformer: OffsetPolarTransform,
     warp_polar_kwargs: dict,
     fftfreq_max: float = 0.5,
-) -> torch.Tensor:
-    """Generate a batch of polar proj. from a DFT, FFT along angular dim."""
+) -> tuple[torch.Tensor, bool, int]:
+    """Generate a batch of polar proj. from a DFT, FFT along angular dim.
+
+    Parameters
+    ----------
+    dft : torch.Tensor
+        Precomputed fftshifted 3D RFFT from `precompute_volume_dft`.
+    volume_mean_scaled : float
+        Constant to add back after IFFT (volume_mean * d).
+    pad_width : int
+        Padding width to remove from projections.
+    phi, theta, psi : torch.Tensor
+        `(B,)` Euler angles in degrees for the batch.
+    fourier_filters : torch.Tensor
+        Fourier space filters to apply. If shape (f, h, w // 2 + 1), then will be
+        applied in real-mode. Can support complex-valued filters in real-space if
+        shape is (f, h, w).
+    transformer : OffsetPolarTransform
+        Pre-initialized transformer for warping to polar coordinates.
+    warp_polar_kwargs : dict
+        Additional kwargs for `warp_offset_polar`.
+    fftfreq_max : float
+        Maximum frequency in cycles per pixel for Fourier slicing. Default is 0.5.
+
+    Returns
+    -------
+    projections_polar_fft : torch.Tensor
+        `(f, B, num_angular_mode, num_radius)` tensor of polar projections in angular
+        frequency space where `f` is the number of Fourier filters and `B` is the
+        projection batch size.
+    is_complex : bool
+        Whether the projections are complex-valued (True) or real-valued (False).
+    num_angular_mode : int
+        Number of angular modes in the polar projection. Will either be
+        `num_angle` (if complex-valued) or `num_angle // 2 + 1` (if real-valued).
+    """
     projections = generate_projection_batch(
         dft=dft,
         volume_mean_scaled=volume_mean_scaled,
@@ -196,16 +248,23 @@ def process_batch(
         **warp_polar_kwargs,
     )
 
-    # FFT along angular dimension
+    # NOTE: Pathing here for handling both real- and complex-valued projections
     # NOTE: Orthonormal transformation to preserve forward-backward scaling of features
-    projections_polar_fft = torch.fft.fft(projections_polar, dim=-2, norm="ortho")
+    is_complex = torch.is_complex(projections_polar)
+    if is_complex:
+        _fft_method = torch.fft.fft
+    else:
+        _fft_method = torch.fft.rfft
+
+    projections_polar_fft = _fft_method(projections_polar, dim=-2, norm="ortho")
+    num_angular_mode = projections_polar_fft.shape[-2]
 
     # Reshape back to (num_defocus, batch_size, num_angle, num_radius)
     projections_polar_fft = projections_polar_fft.view(
-        num_defocus, batch_size, transformer.num_angle, transformer.num_radius
+        num_defocus, batch_size, num_angular_mode, transformer.num_radius
     )
 
-    return projections_polar_fft
+    return projections_polar_fft, is_complex, num_angular_mode
 
 
 def do_pipelined_projection_and_transforms(
@@ -221,7 +280,7 @@ def do_pipelined_projection_and_transforms(
     pad_factor: float = 2.0,
     fftfreq_max: float = 0.5,
     show_progress: bool = True,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, bool]:
     """Pipelined generation and transforms of projections in polar coordinates.
 
     Parameters
@@ -250,14 +309,22 @@ def do_pipelined_projection_and_transforms(
     Returns
     -------
     torch.Tensor
-        `(num_fourier_filters, num_projections, num_angle, num_radius)` complex64 tensor
-        on CPU (pinned memory).
+        `(num_fourier_filters, num_projections, num_angular_mode, num_radius)`
+        complex64 tensor on CPU. When underlying projections are complex, angular dim
+        has been fft-shifted so that indices correspond to
+        [-N/2, -N/2 + 1, ..., 0, 1, ..., N/2 - 1]. When real valued, corresponds to
+        [0, 1, ..., N/2] frequencies.
     """
+    # TODO: check input shapes/types
+
     if fourier_filters is None:
+        filter_shape = (
+            (1, volume.shape[1], volume.shape[2])
+            if torch.is_complex(volume)
+            else (1, volume.shape[1], volume.shape[2] // 2 + 1)
+        )
         fourier_filters = torch.ones(
-            (1, volume.shape[1], volume.shape[2] // 2 + 1),
-            device=volume.device,
-            dtype=torch.complex64,
+            filter_shape, device=volume.device, dtype=torch.complex64
         )
 
     # Precompute the 3D RFFT once — stays on GPU for the entire pipeline
@@ -266,25 +333,40 @@ def do_pipelined_projection_and_transforms(
     )
 
     # Initialize the coordinate transformer to use across batches
-    transform_device = "cuda" if volume.is_cuda else "numpy"
+    transform_device = volume.device if volume.is_cuda else "numpy"
     transformer = OffsetPolarTransform.from_image(
         image_shape=(volume.shape[1], volume.shape[2]),
         num_angle=num_angle,
         num_radius=num_radius,
-        device=transform_device,  # type: ignore
+        device=transform_device,
     )
 
     # Free the original volume from GPU since we only need the DFT now
     del volume
 
+    # NOTE: Doing a dummy batch before allocating memory to get the `is_complex` flag
+    #       and the number of angular modes which need stored
+    _, is_complex, num_angular_mode = process_batch(
+        dft=dft,
+        volume_mean_scaled=volume_mean_scaled,
+        pad_width=pad_width,
+        phi=phi[:2],
+        theta=theta[:2],
+        psi=psi[:2],
+        fourier_filters=fourier_filters,
+        transformer=transformer,
+        warp_polar_kwargs=warp_polar_kwargs,
+        fftfreq_max=fftfreq_max,
+    )
+
     # Allocate memory on CPU for full storage
     num_orientations = phi.shape[0]
     num_filters = fourier_filters.shape[0]
     polar_projections_transformed_cpu = torch.empty(
-        (num_filters, num_orientations, num_angle, num_radius),
+        (num_filters, num_orientations, num_angular_mode, num_radius),
         dtype=torch.complex64,
         device="cpu",
-        pin_memory=True,
+        pin_memory=False,
     )
 
     pbar = None
@@ -300,7 +382,7 @@ def do_pipelined_projection_and_transforms(
         slice_ = slice(start_idx, end_idx)
         batch_size = end_idx - start_idx
 
-        projections_polar_fft = process_batch(
+        projections_polar_fft, is_complex, _ = process_batch(
             dft=dft,
             volume_mean_scaled=volume_mean_scaled,
             pad_width=pad_width,
@@ -312,6 +394,9 @@ def do_pipelined_projection_and_transforms(
             warp_polar_kwargs=warp_polar_kwargs,
             fftfreq_max=fftfreq_max,
         )
+
+        if is_complex:
+            projections_polar_fft = torch.fft.fftshift(projections_polar_fft, dim=-3)
 
         # Copy to CPU pinned memory (async for overlap with next batch compute)
         polar_projections_transformed_cpu[:, slice_].copy_(
@@ -331,4 +416,4 @@ def do_pipelined_projection_and_transforms(
 
     del dft
 
-    return polar_projections_transformed_cpu
+    return polar_projections_transformed_cpu, is_complex

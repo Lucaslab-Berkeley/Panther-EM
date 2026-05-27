@@ -165,11 +165,13 @@ class PolarProjectionDecomposer:
         Parameters
         ----------
         k_max : int | None, optional
-            Maximum angular frequency index to compute. If None, uses all
-            angular components. Default is None.
+            Maximum angular frequency block index to compute. If None, uses all
+            available angular frequencies. Valid range depends on number of angular
+            components (maximum is `num_angle // 2`). For example, if `num_angle=360`,
+            the valid range is `[1, 180]`. Default is None.
         eig_max : int | None, optional
-            Maximum radial eigenvalue index to compute. If None, uses all
-            radial components. Default is None.
+            Maximum radial eigenvalue index to compute. If None, sets eig_max to the
+            number of radial components. Default is None.
         projection_batch_size : int, optional
             Number of projections to process at a time for memory efficiency.
             Default is 128.
@@ -182,58 +184,88 @@ class PolarProjectionDecomposer:
         DecompositionResult
             The decomposition result containing singular values and vectors.
         """
-        # Stage 1: GPU projection generation and transform. Results are generally too
-        # large to fit in GPU memory, so stored on CPU memory.
-        polar_projections_transformed_cpu = do_pipelined_projection_and_transforms(
-            volume=self.volume,
-            phi=self.phi_values,
-            theta=self.theta_values,
-            psi=torch.zeros_like(self.phi_values),
-            fourier_filters=self.fourier_filters,
-            num_angle=self.num_angle,
-            num_radius=self.num_radius,
-            warp_polar_kwargs={"preserve_energy": True},
-            projection_batch_size=projection_batch_size,
+        ### Stage 1: GPU projection generation and transform.
+        # Results generally too large to fit in GPU memory, so stored on CPU
+        polar_projections_transformed_cpu, is_complex = (
+            do_pipelined_projection_and_transforms(
+                volume=self.volume,
+                phi=self.phi_values,
+                theta=self.theta_values,
+                psi=torch.zeros_like(self.phi_values),
+                fourier_filters=self.fourier_filters,
+                num_angle=self.num_angle,
+                num_radius=self.num_radius,
+                warp_polar_kwargs={"preserve_energy": True},
+                projection_batch_size=projection_batch_size,
+            )
         )
 
-        # Stage 2: Decompose each frequency block with SVD
-        # Store original shape for later reshaping of results
+        ### Stage 2: Decompose each frequency block with SVD
         batch_shape = polar_projections_transformed_cpu.shape[:-2]
-        num_angle, num_radius = polar_projections_transformed_cpu.shape[-2:]
+        num_angular_mode, num_radius = polar_projections_transformed_cpu.shape[-2:]
 
         # Flatten all outer dimensions:
-        # (..., num_angle, num_radius) -> (batch_size, num_angle, num_radius)
+        # from (..., num_angular_mode, num_radius)
+        # ---> (batch_size, num_angular_mode, num_radius)
         batch_size = int(np.prod(batch_shape))
         polar_projections_reshaped = polar_projections_transformed_cpu.reshape(
-            batch_size, num_angle, num_radius
+            batch_size, num_angular_mode, num_radius
         )
 
-        # Determine k_max
-        if k_max is None:
-            k_max = num_angle
+        # Validate and select frequency block range
+        # NOTE: For complex projection data (when `is_complex=True`) frequency blocks
+        #       are stored in fftshifted order ranging from -k_max to +k_max. Select
+        #       block indices accordingly
+        if is_complex:
+            allowable_k_max = num_angular_mode // 2
+            if k_max is None:
+                k_max = allowable_k_max
+            elif k_max < 1 or k_max > allowable_k_max:
+                raise ValueError(
+                    f"k_max must be in [1, {allowable_k_max}] for complex projection "
+                    f"data with num_angular_mode={num_angular_mode}, got k_max={k_max}"
+                )
+            dc_data_index = num_angular_mode // 2
+            block_index_min = dc_data_index - k_max
+            block_index_max = dc_data_index + k_max
+        else:
+            allowable_k_max = num_angular_mode
+            if k_max is None:
+                k_max = allowable_k_max
+            elif k_max < 1 or k_max > allowable_k_max:
+                raise ValueError(
+                    f"k_max must be in [1, {allowable_k_max}] for real projection "
+                    f"data with num_angular_mode={num_angular_mode}, got k_max={k_max}"
+                )
+            block_index_min = 0
+            block_index_max = k_max
 
-        # Determine eig_max
         if eig_max is None:
             eig_max = num_radius
+        if eig_max < 1 or eig_max > num_radius:
+            raise ValueError(
+                f"eig_max must be in the range [1, {num_radius}] "
+                f"for num_radius={num_radius}, got eig_max={eig_max}"
+            )
+
+        num_freq_block = block_index_max - block_index_min
 
         # Allocate tensors for the SVD results on CPU
         U = torch.zeros(
-            (*batch_shape, k_max, eig_max), dtype=torch.complex64, device="cpu"
+            (*batch_shape, num_freq_block, eig_max), dtype=torch.complex64, device="cpu"
         )
-        S = torch.zeros((k_max, eig_max), dtype=torch.float32, device="cpu")
+        S = torch.zeros((num_freq_block, eig_max), dtype=torch.float32, device="cpu")
         Vh = torch.zeros(
-            (k_max, eig_max, num_radius),
+            (num_freq_block, eig_max, num_radius),
             dtype=torch.complex64,
             device="cpu",
         )
 
-        # Stage 2: Loop over frequency blocks in batches for batched SVD decomposition
-        for k_start in tqdm.tqdm(
-            range(0, k_max, block_batch_size), desc="decomp freq blocks"
-        ):
-            k_end = min(k_start + block_batch_size, k_max)
-            num_k_batch = k_end - k_start
-            k_indices = torch.arange(k_start, k_end, device="cpu")
+        block_index_range = range(block_index_min, block_index_max, block_batch_size)
+        for k_result_start in tqdm.tqdm(block_index_range, desc="decomp freq blocks"):
+            k_result_end = min(k_result_start + block_batch_size, num_freq_block)
+            num_k_batch = k_result_end - k_result_start
+            k_indices = torch.arange(k_result_start, k_result_end, device="cpu")
 
             freq_blocks = polar_projections_reshaped[:, k_indices, :]
             freq_blocks = freq_blocks.to(device=self.device, non_blocking=True)
@@ -263,9 +295,10 @@ class PolarProjectionDecomposer:
             Vh=Vh.cpu().numpy(),
             k_max=k_max,
             eig_max=eig_max,
-            num_fourier_filters=batch_shape[0] if len(batch_shape) > 0 else 1,
-            num_orientations=batch_shape[1] if len(batch_shape) > 1 else 1,
-            num_angular_components=num_angle,
+            is_complex_projection=is_complex,
+            num_fourier_filters=batch_shape[0],
+            num_orientations=batch_shape[1],
+            num_angular_components=self.num_angle,
             num_radial_components=num_radius,
         )
 
