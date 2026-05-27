@@ -318,7 +318,8 @@ class ProjectionReconstructor:
                 k_idx, in_plane_rotation
             )
 
-            polar_projection += torch.outer(angular_component, radial_contribution)
+            tmp_contribution = torch.outer(angular_component, radial_contribution)
+            polar_projection += tmp_contribution
 
             # For real-valued decompositions the -k block equals conj(+k block).
             # DC (k=0) and Nyquist are self-conjugate; all other stored positive
@@ -326,9 +327,7 @@ class ProjectionReconstructor:
             if not self.result.is_complex_projection and k_idx > 0:
                 is_nyquist = (N % 2 == 0) and (k_idx == N // 2)
                 if not is_nyquist:
-                    polar_projection += torch.outer(
-                        angular_component.conj(), radial_contribution.conj()
-                    )
+                    polar_projection += tmp_contribution.conj()
 
         if return_polar:
             return polar_projection if return_torch else polar_projection.cpu().numpy()
@@ -452,15 +451,14 @@ class ProjectionReconstructor:
             vh_k = self._Vh[k_stored, eig_idx_tensor]  # (E, R)
 
             radial = (u_batch * s_k[None, :]) @ vh_k  # (B, R)
-            polar_projections += angular_batch[:, :, None] * radial[:, None, :]
+            tmp_contribution = angular_batch[:, :, None] * radial[:, None, :]
+            polar_projections += tmp_contribution
 
             # For real-valued decompositions the -k block equals conj(+k block).
             if not self.result.is_complex_projection and k_idx > 0:
                 is_nyquist = (N % 2 == 0) and (k_idx == N // 2)
                 if not is_nyquist:
-                    polar_projections += (
-                        angular_batch.conj()[:, :, None] * radial.conj()[:, None, :]
-                    )
+                    polar_projections += tmp_contribution.conj()
 
         if return_polar:
             return (
