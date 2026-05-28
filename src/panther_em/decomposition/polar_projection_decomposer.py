@@ -8,7 +8,7 @@ import tqdm
 
 from panther_em.decomposition.result import DecompositionResult
 from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-from panther_em.utils.transform_base import CoordinateTransform
+from panther_em.utils.transform_base import CoordinateTransform, GridTransform
 
 from .pipeline_projections import do_pipelined_projection_and_transforms
 
@@ -170,11 +170,8 @@ class PolarProjectionDecomposer:
         """
         ### Stage 1: GPU projection generation and transform.
 
-        # device-specific copy of the transform for GPU computation.
-        transform_device = self.device if self.device.type == "cuda" else "numpy"
-        transformer = type(self._coordinate_transform).from_dict(
-            self._coordinate_transform.to_dict(), device=transform_device
-        )
+        # Transforms are device-agnostic; GPU dispatch is handled internally.
+        transformer = self._coordinate_transform
 
         # Results generally too large to fit in GPU memory, so stored on CPU
         polar_projections_transformed_cpu, is_complex = (
@@ -278,10 +275,8 @@ class PolarProjectionDecomposer:
             S[k_indices] = s.cpu()
             Vh[k_indices, :, :] = vh.cpu()
 
-        # store CPU (numpy) copy of transformer in result serialization
-        result_transform = type(transformer).from_dict(
-            transformer.to_dict(), device="numpy"
-        )
+        # Eagerly materialize all coord grids into a self-contained GridTransform.
+        result_transform = GridTransform.from_transform(transformer)
 
         # Convert results back to numpy for storage
         fourier_filters_np = (
@@ -289,7 +284,7 @@ class PolarProjectionDecomposer:
             if self.fourier_filters is not None
             else None
         )
-        num_angle = transformer.polar_shape[0]
+        num_angle = result_transform.polar_shape[0]
         self._result = DecompositionResult(
             S=S.cpu().numpy().astype(np.float32),
             U=U.cpu().numpy(),

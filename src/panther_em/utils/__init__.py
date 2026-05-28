@@ -5,6 +5,8 @@
 from .nonuniform_polar_transform import NonUniformPolarTransform
 from .transform_base import (
     CoordinateTransform,
+    GridTransform,
+    get_transform,
     get_transform_class,
     reconstruct_transform,
     register_transform,
@@ -13,8 +15,10 @@ from .warp_transforms import OffsetPolarTransform
 
 __all__ = [
     "CoordinateTransform",
+    "GridTransform",
     "NonUniformPolarTransform",
     "OffsetPolarTransform",
+    "get_transform",
     "get_transform_class",
     "reconstruct_transform",
     "register_transform",

@@ -20,11 +20,8 @@ class ProjectionReconstructor:
         self.result = result
         self.device = torch.device(device)
 
-        # Reconstruct the transform on the requested device from serialized geometry.
-        transform_device = self.device if self.device.type == "cuda" else "numpy"
-        self._coordinate_transform = result.coordinate_transform.__class__.from_dict(
-            result.coordinate_transform.to_dict(), device=transform_device
-        )
+        # GridTransform is device-agnostic; GPU dispatch is handled internally.
+        self._coordinate_transform = result.coordinate_transform
         self.image_shape: tuple[int, int] = self._coordinate_transform.cartesian_shape
 
         self._U = torch.tensor(result.U, dtype=torch.complex64, device=self.device)

@@ -5,14 +5,13 @@ import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 
-if TYPE_CHECKING:
-    from panther_em.utils.transform_base import CoordinateTransform
+from panther_em.utils.transform_base import CoordinateTransform, GridTransform
 
 
 @dataclass
@@ -109,7 +108,7 @@ class DecompositionResult:
     # Optional coordinate transform used during decomposition
     # When present, DecompositionResult.save() embeds the transform's geometric
     # parameters so the file is self-contained for inference.
-    coordinate_transform: "CoordinateTransform | None" = field(default=None, repr=False)
+    coordinate_transform: CoordinateTransform | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Validate shapes after initialization."""
@@ -230,6 +229,24 @@ class DecompositionResult:
         if self.fourier_filters is not None:
             f.create_dataset("fourier_filters", data=self.fourier_filters)
 
+    def _write_hdf5_transform_arrays(self, f: h5py.File) -> None:
+        """Write coordinate grid arrays for a GridTransform into an HDF5 group."""
+        from panther_em.utils.transform_base import GridTransform
+
+        if not isinstance(self.coordinate_transform, GridTransform):
+            return
+
+        grp = f.create_group("transform")
+        grp.create_dataset(
+            "transform_coords", data=self.coordinate_transform.transform_coords
+        )
+        grp.create_dataset(
+            "cartesian_coords", data=self.coordinate_transform.cartesian_coords
+        )
+        jac = self.coordinate_transform.jacobian_grid
+        if jac is not None:
+            grp.create_dataset("jacobian", data=jac)
+
     def save(self, path: str | Path) -> None:
         """Save the full decomposition result to an HDF5 file.
 
@@ -253,6 +270,7 @@ class DecompositionResult:
             f.create_dataset("S", data=self.S)
             f.create_dataset("Vh", data=self.Vh)
             self._write_hdf5_optional_arrays(f)
+            self._write_hdf5_transform_arrays(f)
 
     def save_top_n(self, path: str | Path, top_k: int) -> None:
         r"""Save only the ``top_k`` most significant components to HDF5.
@@ -308,6 +326,7 @@ class DecompositionResult:
             f.create_dataset("S", data=S_sparse)
             f.create_dataset("Vh", data=Vh_sparse)
             self._write_hdf5_optional_arrays(f)
+            self._write_hdf5_transform_arrays(f)
 
     @classmethod
     def load(cls, path: str | Path) -> "DecompositionResult":
@@ -372,13 +391,42 @@ class DecompositionResult:
                     f"The file '{path}' has no 'transform_config' attribute. "
                 )
 
-            # Import lazily to avoid circular-import at module level
-            from panther_em.utils.transform_base import reconstruct_transform
-
             transform_json = f.attrs["transform_config"]
             if isinstance(transform_json, bytes):
                 transform_json = transform_json.decode("utf-8")
-            coordinate_transform = reconstruct_transform(json.loads(transform_json))
+            transform_params = json.loads(transform_json)
+            coordinate_transform: CoordinateTransform
+
+            if transform_params.get("transform_name") == "grid":
+                transform_coords = f["transform/transform_coords"][()]
+                cartesian_coords = f["transform/cartesian_coords"][()]
+                jacobian = (
+                    f["transform/jacobian"][()] if "transform/jacobian" in f else None
+                )
+                polar_shape = (
+                    int(transform_params["polar_shape"][0]),
+                    int(transform_params["polar_shape"][1]),
+                )
+                cartesian_shape = (
+                    int(transform_params["cartesian_shape"][0]),
+                    int(transform_params["cartesian_shape"][1]),
+                )
+                coordinate_transform = GridTransform.from_arrays(
+                    transform_coords=transform_coords,
+                    cartesian_coords=cartesian_coords,
+                    jacobian=jacobian,
+                    polar_shape=polar_shape,
+                    cartesian_shape=cartesian_shape,
+                    source_params=transform_params.get("source_params"),
+                    has_periodic_axis=bool(
+                        transform_params.get("has_periodic_axis", True)
+                    ),
+                    periodic_axis=int(transform_params.get("periodic_axis", 0)),
+                )
+            else:
+                from panther_em.utils.transform_base import reconstruct_transform
+
+                coordinate_transform = reconstruct_transform(transform_params)
 
             if is_sparse:
                 # Scatter compact arrays into zero-filled dense arrays so that
