@@ -6,9 +6,9 @@ import numpy as np
 import torch
 import tqdm
 
+from panther_em.coordinates.transform_base import CoordinateTransform, GridTransform
 from panther_em.decomposition.result import DecompositionResult
 from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-from panther_em.utils.transform_base import CoordinateTransform, GridTransform
 
 from .pipeline_projections import do_pipelined_projection_and_transforms
 

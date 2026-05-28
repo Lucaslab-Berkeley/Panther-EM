@@ -27,7 +27,7 @@ import tqdm
 from torch_fourier_slice.slice_extraction import extract_central_slices_rfft_3d
 from torch_fourier_slice.volume_utils import compute_cube_face_averages
 
-from panther_em.utils.transform_base import CoordinateTransform
+from panther_em.coordinates.transform_base import CoordinateTransform
 
 
 def precompute_volume_dft(

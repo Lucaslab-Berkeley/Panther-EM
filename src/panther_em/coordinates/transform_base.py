@@ -5,7 +5,10 @@ Registering a custom transform
 Decorate your subclass with :func:`register_transform` and set the class
 attribute ``transform_name`` to a unique string key::
 
-    from panther_em.utils.transform_base import CoordinateTransform, register_transform
+    from panther_em.coordinates.transform_base import (
+        CoordinateTransform,
+        register_transform,
+    )
 
 
     @register_transform
@@ -33,7 +36,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .warp_backends import detect_device, ensure_device, get_warp_function
+from panther_em.utils.warp_backends import (
+    detect_device,
+    ensure_device,
+    get_warp_function,
+)
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -626,7 +633,8 @@ class GridTransform(CoordinateTransform):
     Construction
     ------------
     * :meth:`from_transform` — eagerly materialize grids from a parameterized
-      transform (e.g. :class:`~panther_em.utils.warp_transforms.OffsetPolarTransform`).
+      transform (e.g.
+      :class:`~panther_em.coordinates.offset_polar.OffsetPolarTransform`).
     * :meth:`from_arrays` — construct directly from NumPy arrays (e.g. when
       loading from HDF5).
 
@@ -681,7 +689,7 @@ class GridTransform(CoordinateTransform):
         ----------
         transform : CoordinateTransform
             Source transform (e.g. an
-            :class:`~panther_em.utils.warp_transforms.OffsetPolarTransform`).
+            :class:`~panther_em.coordinates.offset_polar.OffsetPolarTransform`).
 
         Returns
         -------

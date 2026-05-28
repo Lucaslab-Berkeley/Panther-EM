@@ -11,7 +11,11 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 
-from panther_em.utils.transform_base import CoordinateTransform, GridTransform
+from panther_em.coordinates.transform_base import (
+    CoordinateTransform,
+    GridTransform,
+    reconstruct_transform,
+)
 
 
 @dataclass
@@ -231,8 +235,6 @@ class DecompositionResult:
 
     def _write_hdf5_transform_arrays(self, f: h5py.File) -> None:
         """Write coordinate grid arrays for a GridTransform into an HDF5 group."""
-        from panther_em.utils.transform_base import GridTransform
-
         if not isinstance(self.coordinate_transform, GridTransform):
             return
 
@@ -424,8 +426,6 @@ class DecompositionResult:
                     periodic_axis=int(transform_params.get("periodic_axis", 0)),
                 )
             else:
-                from panther_em.utils.transform_base import reconstruct_transform
-
                 coordinate_transform = reconstruct_transform(transform_params)
 
             if is_sparse:
