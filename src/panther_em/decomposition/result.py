@@ -1,14 +1,18 @@
 """Dataclass for storing decomposition results."""
 
+import json
 import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
+
+if TYPE_CHECKING:
+    from panther_em.utils.transform_base import CoordinateTransform
 
 
 @dataclass
@@ -102,6 +106,11 @@ class DecompositionResult:
     # Optional Fourier filters recorded at decomposition time
     fourier_filters: np.ndarray | None = None
 
+    # Optional coordinate transform used during decomposition
+    # When present, DecompositionResult.save() embeds the transform's geometric
+    # parameters so the file is self-contained for inference.
+    coordinate_transform: "CoordinateTransform | None" = field(default=None, repr=False)
+
     def __post_init__(self) -> None:
         """Validate shapes after initialization."""
         if self.is_complex_projection:
@@ -163,6 +172,11 @@ class DecompositionResult:
 
     def __repr__(self) -> str:
         """String representation of the DecompositionResult."""
+        transform_name = (
+            getattr(self.coordinate_transform, "transform_name", None)
+            if self.coordinate_transform is not None
+            else None
+        )
         s = textwrap.dedent(f"""
             DecompositionResult(
                 k_max={self.k_max},
@@ -174,6 +188,7 @@ class DecompositionResult:
                 num_radial_components={self.num_radial_components},
                 has_euler_angles={self.phi_values is not None},
                 has_fourier_filters={self.fourier_filters is not None},
+                coordinate_transform='{transform_name}',
                 created_at='{self.created_at}'
             )
             """)
@@ -194,6 +209,17 @@ class DecompositionResult:
         f.attrs["num_angular_components"] = self.num_angular_components
         f.attrs["num_radial_components"] = self.num_radial_components
         f.attrs["created_at"] = self.created_at
+
+        # Embed coordinate transform geometry so the file is self-contained.
+        # A result without a transform cannot be saved — inference depends on it.
+        if self.coordinate_transform is None:
+            raise ValueError(
+                "DecompositionResult.coordinate_transform is None. "
+                "A coordinate transform must be set before saving. "
+                "Run do_decomposition() first, or assign a CoordinateTransform "
+                "instance to result.coordinate_transform."
+            )
+        f.attrs["transform_config"] = json.dumps(self.coordinate_transform.to_dict())
 
     def _write_hdf5_optional_arrays(self, f: h5py.File) -> None:
         """Write optional orientation angles and Fourier filters if present."""
@@ -340,6 +366,20 @@ class DecompositionResult:
                 f["fourier_filters"][()] if "fourier_filters" in f else None
             )
 
+            # Load coordinate transform — required; raise if absent or unreadable.
+            if "transform_config" not in f.attrs:
+                raise KeyError(
+                    f"The file '{path}' has no 'transform_config' attribute. "
+                )
+
+            # Import lazily to avoid circular-import at module level
+            from panther_em.utils.transform_base import reconstruct_transform
+
+            transform_json = f.attrs["transform_config"]
+            if isinstance(transform_json, bytes):
+                transform_json = transform_json.decode("utf-8")
+            coordinate_transform = reconstruct_transform(json.loads(transform_json))
+
             if is_sparse:
                 # Scatter compact arrays into zero-filled dense arrays so that
                 # all existing indexing (get_top_n, get_component, compute_weights)
@@ -382,6 +422,7 @@ class DecompositionResult:
                 phi_values=phi_values,
                 theta_values=theta_values,
                 fourier_filters=fourier_filters,
+                coordinate_transform=coordinate_transform,
             )
 
     # ------------------------------------------------------------------

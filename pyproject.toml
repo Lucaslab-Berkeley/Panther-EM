@@ -46,6 +46,7 @@ dependencies = [
     "mrcfile",
     "torch",
     "matplotlib",
+    "h5py",
     "ttsim3d",
     "torch-fourier-slice",
     "torch-so3",

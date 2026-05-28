@@ -2,7 +2,6 @@
 
 import numpy as np
 
-
 # NOTE: Offset polar grids have every other ring offset by (delta_theta / 2) to better
 #       sample 2D space (less dramatic angular gaps at larger radii). Parameter below
 #       controls application of offset or not (True - apply offset, False - no offset).

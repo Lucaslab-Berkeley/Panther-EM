@@ -8,6 +8,7 @@ import tqdm
 
 from panther_em.decomposition.result import DecompositionResult
 from panther_em.inference.projection_reconstruction import ProjectionReconstructor
+from panther_em.utils.transform_base import CoordinateTransform
 
 from .pipeline_projections import do_pipelined_projection_and_transforms
 
@@ -22,42 +23,26 @@ class PolarProjectionDecomposer:
     Parameters
     ----------
     volume : np.ndarray | torch.Tensor
-        The 3D volume to decompose. If torch.Tensor, should be on the target device.
+        The 3D volume to decompose.
     phi_values : np.ndarray | torch.Tensor
         Phi values, in degrees of ZYZ Euler angles, for projection orientations.
     theta_values : np.ndarray | torch.Tensor
         Theta values, in degrees of ZYZ Euler angles, for projection orientations.
-    num_radius : int
-        Number of radial components in polar projections.
-    num_angle : int, optional
-        Number of angular components in polar projections. Default is 360.
+    coordinate_transform : CoordinateTransform
+        Pre-built coordinate transform that defines the polar-space geometry.
+    fourier_filters : np.ndarray | torch.Tensor | None, optional
+        Pre-computed Fourier-space filters to apply during projection. Default is None
+        (identity filter).
     device : str | torch.device, optional
-        Device to use for computation ('cpu', 'cuda', 'cuda:0', etc.). Default is 'cpu'.
+        Compute device ('cpu', 'cuda', 'cuda:0', etc.). Default is 'cpu'.
 
     Attributes
     ----------
-    result : DecompositionResult | None
-        The decomposition result after calling `do_decomposition()`.
-    polar_transform : OffsetPolarTransform | None
-        Transform object for efficient polar<->cartesian conversion after decomposition.
-
-    Examples
-    --------
-    >>> # CPU computation with numpy
-    >>> decomposer = PolarProjectionDecomposer(
-    ...     volume, phi, theta, num_radius=256, num_angle=720, device="cpu"
-    ... )
-    >>> result = decomposer.do_decomposition()
-
-    >>> # GPU computation with torch tensors
-    >>> volume_gpu = torch.from_numpy(volume).cuda()
-    >>> phi_gpu = torch.from_numpy(phi).cuda()
-    >>> theta_gpu = torch.from_numpy(theta).cuda()
-    >>> decomposer = PolarProjectionDecomposer(
-    ...     volume_gpu, phi_gpu, theta_gpu, num_radius=256, num_angle=720, device="cuda"
-    ... )
-    >>> result = decomposer.do_decomposition()
-    >>> result.save("decomposition.npz")
+    result : DecompositionResult
+        The decomposition result after calling :meth:`do_decomposition`.
+    reconstructor : ProjectionReconstructor
+        An object to perform reconstruction of decomposed features back into the input
+        projections.
     """
 
     def __init__(
@@ -65,9 +50,8 @@ class PolarProjectionDecomposer:
         volume: np.ndarray | torch.Tensor,
         phi_values: np.ndarray | torch.Tensor,
         theta_values: np.ndarray | torch.Tensor,
-        num_radius: int,
+        coordinate_transform: CoordinateTransform,
         fourier_filters: np.ndarray | torch.Tensor | None = None,
-        num_angle: int = 360,
         device: str | torch.device = "cpu",
     ) -> None:
         """Initialize the polar projection decomposer."""
@@ -100,9 +84,7 @@ class PolarProjectionDecomposer:
             fourier_filters.to(self.device) if fourier_filters is not None else None
         )
 
-        self.num_radius = num_radius
-        self.num_angle = num_angle
-
+        self._coordinate_transform: CoordinateTransform = coordinate_transform
         self._result: DecompositionResult | None = None
 
     @property
@@ -142,7 +124,6 @@ class PolarProjectionDecomposer:
         """
         return ProjectionReconstructor(
             result=self.result,
-            image_shape=tuple(self.volume.shape[-2:]),
             device=self.device,
         )
 
@@ -188,6 +169,13 @@ class PolarProjectionDecomposer:
             The decomposition result containing singular values and vectors.
         """
         ### Stage 1: GPU projection generation and transform.
+
+        # device-specific copy of the transform for GPU computation.
+        transform_device = self.device if self.device.type == "cuda" else "numpy"
+        transformer = type(self._coordinate_transform).from_dict(
+            self._coordinate_transform.to_dict(), device=transform_device
+        )
+
         # Results generally too large to fit in GPU memory, so stored on CPU
         polar_projections_transformed_cpu, is_complex = (
             do_pipelined_projection_and_transforms(
@@ -196,8 +184,7 @@ class PolarProjectionDecomposer:
                 theta=self.theta_values,
                 psi=torch.zeros_like(self.phi_values),
                 fourier_filters=self.fourier_filters,
-                num_angle=self.num_angle,
-                num_radius=self.num_radius,
+                transformer=transformer,
                 warp_polar_kwargs={"preserve_energy": True},
                 projection_batch_size=projection_batch_size,
             )
@@ -291,12 +278,18 @@ class PolarProjectionDecomposer:
             S[k_indices] = s.cpu()
             Vh[k_indices, :, :] = vh.cpu()
 
+        # store CPU (numpy) copy of transformer in result serialization
+        result_transform = type(transformer).from_dict(
+            transformer.to_dict(), device="numpy"
+        )
+
         # Convert results back to numpy for storage
         fourier_filters_np = (
             self.fourier_filters.cpu().numpy()
             if self.fourier_filters is not None
             else None
         )
+        num_angle = transformer.polar_shape[0]
         self._result = DecompositionResult(
             S=S.cpu().numpy().astype(np.float32),
             U=U.cpu().numpy(),
@@ -306,11 +299,12 @@ class PolarProjectionDecomposer:
             is_complex_projection=is_complex,
             num_fourier_filters=batch_shape[0],
             num_orientations=batch_shape[1],
-            num_angular_components=self.num_angle,
+            num_angular_components=num_angle,
             num_radial_components=num_radius,
             phi_values=self.phi_values.cpu().numpy(),
             theta_values=self.theta_values.cpu().numpy(),
             fourier_filters=fourier_filters_np,
+            coordinate_transform=result_transform,
         )
 
         return self._result
@@ -320,50 +314,45 @@ class PolarProjectionDecomposer:
         cls,
         result: DecompositionResult | str | Path,
         volume: np.ndarray | torch.Tensor,
-        phi_values: np.ndarray | torch.Tensor | None = None,
-        theta_values: np.ndarray | torch.Tensor | None = None,
         device: str | torch.device = "cpu",
     ) -> "PolarProjectionDecomposer":
-        """Create a decomposer with a pre-computed result.
-
-        Useful for loading saved decompositions and constructing features
-        without re-running the decomposition.
+        """Create a decomposer from a pre-computed (or loaded) result.
 
         Parameters
         ----------
         result : DecompositionResult | str | Path
-            A DecompositionResult instance or path to a saved result.
+            A :class:`~panther_em.decomposition.result.DecompositionResult`
+            instance or a path to a saved ``.h5`` file.
         volume : np.ndarray | torch.Tensor
-            The volume (needed for Cartesian feature construction).
-        phi_values : np.ndarray | torch.Tensor | None, optional
-            Azimuthal angles. Can be None if only constructing features.
-        theta_values : np.ndarray | torch.Tensor | None, optional
-            Polar angles. Can be None if only constructing features.
+            The original 3D volume (needed if further decomposition will be run).
         device : str | torch.device, optional
-            Device to use for computation. Default is 'cpu'.
+            Compute device. Default is 'cpu'.
 
         Returns
         -------
         PolarProjectionDecomposer
-            A decomposer instance with the loaded result.
+            Decomposer instance pre-loaded with the given result.
         """
         if isinstance(result, (str, Path)):
             result = DecompositionResult.load(result)
 
+        if result.coordinate_transform is None:
+            raise ValueError(
+                "The loaded DecompositionResult has no embedded coordinate_transform. "
+                "Re-run decomposition with the current code to produce a result that "
+                "contains the transform."
+            )
+
         device_obj = torch.device(device)
 
-        # Create dummy arrays if not provided
-        if phi_values is None:
-            phi_values = torch.zeros(result.num_orientations, device=device_obj)
-        if theta_values is None:
-            theta_values = torch.zeros(result.num_orientations, device=device_obj)
+        phi_values = torch.zeros(result.num_orientations, device=device_obj)
+        theta_values = torch.zeros(result.num_orientations, device=device_obj)
 
         instance = cls(
             volume,
             phi_values,
             theta_values,
-            num_radius=result.num_radial_components,
-            num_angle=result.num_angular_components,
+            coordinate_transform=result.coordinate_transform,
             device=device_obj,
         )
         instance._result = result

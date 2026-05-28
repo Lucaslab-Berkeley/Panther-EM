@@ -1,28 +1,14 @@
-"""Custom warp transformation functions.
+"""Coordinate transforms between Cartesian and offset-polar spaces.
 
-The `scikit-image` package includes a function for a forward cartesian-to-polar
-transformation on 2D images, but the inverse polar-to-cartesian transformation is
-absent. This module provides forward and inverse transformations between cartesian and
-polar coordinates with the following support:
-- NumPy transforms (CPU) and PyTorch transforms (GPU) with the same API.
-- Single 2D images and batched 3D inputs of multiple images.
-- Caching of coordinate mappings for efficiency when applying the same transformation
-  to multiple images of the same shape and parameters.
-- Optional energy-preserving transforms (Jacobian correction) to scale values in polar
-  space by area element.
-- Custom interpolation mode along the angular axis to properly wrap images at the
-  0°/360° boundary.
+This module provides the :class:`OffsetPolarTransform` class, which implements the
+:class:`~panther_em.utils.transform_base.CoordinateTransform` interface for the
+offset-polar coordinate system.  Features:
 
-For an round-trip energy preserving transform, use the following pattern:
-```python
-# Apply zero-padding to the forward transformation
-polar_img = warp_offset_polar(..., preserve_energy=True, mode="constant", cval=0.0)
-
-# Apply wrap padding *only* on the angular dimension (handled internally)
-cartesian_img = warp_offset_polar_inverse(
-    ..., preserve_energy=True, wrap_angular_axis=True, mode="constant", cval=0.0
-)
-```
+- NumPy (CPU) and PyTorch CUDA backends with the same API.
+- Single 2D images and batched 3D inputs.
+- Per-instance coordinate-grid caching for repeated warps on the same geometry.
+- Optional energy-preserving transforms via Jacobian correction.
+- Circular padding at the 0°/360° boundary for the inverse transform.
 """
 
 from collections.abc import Callable
@@ -36,13 +22,12 @@ from .coordinates import (
     inverse_offset_polar_to_cartesian_mapping,
     jacobian_correction_offset_polar,
 )
+from .transform_base import CoordinateTransform, register_transform
 from .warp_backends import (
     detect_device,
     ensure_device,
     get_warp_function,
 )
-
-_TRANSFORMER_CACHE = {}
 
 
 def _normalize_transform_device(
@@ -76,135 +61,14 @@ def _get_bhw_of_image(image: np.ndarray | torch.Tensor) -> tuple[int | None, int
     raise ValueError(f"Input image must be 2D or 3D (batched), got {image.ndim}D.")
 
 
-def warp_offset_polar(
-    image: np.ndarray | torch.Tensor,
-    num_angle: int,
-    num_radius: int,
-    center: tuple[float, float],
-    radius: float,
-    preserve_energy: bool = True,
-    **kwargs: dict[Any, Any],
-) -> np.ndarray | torch.Tensor:
-    """Wrapper around the OffsetPolarTransform class for the forward transformation.
-
-    NOTE: This function automatically detects whether the input is a NumPy array
-    or PyTorch tensor and uses the appropriate backend (CPU or GPU).
-
-    Parameters
-    ----------
-    image : np.ndarray or torch.Tensor
-        Input image in cartesian coordinates.
-    num_angle : int
-        Number of angular samples in the output polar image.
-    num_radius : int
-        Number of radial samples in the output polar image.
-    center : tuple[float, float]
-        Center of the transformation (row, col).
-    radius : float
-        Maximum radius for the transformation.
-    preserve_energy : bool, optional
-        Whether to apply a Jacobian correction to preserve energy between polar and
-        cartesian spaces. By default True.
-    **kwargs
-        Additional arguments passed to the warp function.
-
-    Returns
-    -------
-    np.ndarray or torch.Tensor
-        Warped image in offset polar coordinates (same type as input).
-    """
-    # Auto-detect device from input
-    device = detect_device(image)
-    _, h, w = _get_bhw_of_image(image)
-
-    # Create cache key that includes device
-    key = (device, center, radius, num_angle, num_radius, (h, w))
-    if key not in _TRANSFORMER_CACHE:
-        _TRANSFORMER_CACHE[key] = OffsetPolarTransform(
-            center=center,
-            radius=radius,
-            num_angle=num_angle,
-            num_radius=num_radius,
-            height=h,
-            width=w,
-            device=device,
-        )
-
-    transformer = _TRANSFORMER_CACHE[key]
-
-    return transformer.to_offset_polar(image, preserve_energy=preserve_energy, **kwargs)  # type: ignore
-
-
-def warp_offset_polar_inverse(
-    image: np.ndarray | torch.Tensor,
-    height: int,
-    width: int,
-    center: tuple[float, float],
-    radius: float,
-    preserve_energy: bool = True,
-    wrap_angular_axis: bool = True,
-    **kwargs: dict[Any, Any],
-) -> np.ndarray | torch.Tensor:
-    """Wrapper around the OffsetPolarTransform class for the inverse transformation.
-
-    NOTE: This function automatically detects whether the input is a NumPy array or
-    PyTorch tensor and uses the appropriate backend (CPU or GPU).
-
-    Parameters
-    ----------
-    image : np.ndarray or torch.Tensor
-        Input image in offset polar coordinates.
-    height : int
-        Height of the output cartesian image.
-    width : int
-        Width of the output cartesian image.
-    center : tuple[float, float]
-        Center of the transformation (row, col).
-    radius : float
-        Maximum radius for the transformation.
-    preserve_energy : bool, optional
-        Whether to apply a Jacobian correction to preserve energy between polar and
-        cartesian spaces. By default True.
-    wrap_angular_axis : bool, optional
-        Whether to apply wrap padding along the angular axis *only* for proper
-        interpolation across the 360-0 degree boundary.
-    **kwargs
-        Additional arguments passed to the warp function.
-
-    Returns
-    -------
-    np.ndarray or torch.Tensor
-        Warped image in cartesian coordinates (same type as input).
-    """
-    # Auto-detect device from input
-    device = detect_device(image)
-    _, na, nr = _get_bhw_of_image(image)
-
-    # Create cache key that includes device
-    key = (device, center, radius, na, nr, (height, width))
-    if key not in _TRANSFORMER_CACHE:
-        _TRANSFORMER_CACHE[key] = OffsetPolarTransform(
-            center=center,
-            radius=radius,
-            num_angle=na,
-            num_radius=nr,
-            height=height,
-            width=width,
-            device=device,
-        )
-
-    transformer = _TRANSFORMER_CACHE[key]
-
-    return transformer.to_cartesian(
-        image,
-        preserve_energy=preserve_energy,
-        wrap_angular_axis=wrap_angular_axis,
-        **kwargs,  # type: ignore
-    )
-
-
-class OffsetPolarTransform:
+@register_transform
+class OffsetPolarTransform(CoordinateTransform):
     """Manages offset polar coordinate transformations with coordinate caching.
+
+    The *offset polar* coordinate system is identical to standard polar
+    coordinates except that every other radial ring is angularly offset by
+    half of the angular step size (``delta_theta / 2``). Improves spatial coverage
+    (compared to standard polar coords) without introducing much more complexity.
 
     Parameters
     ----------
@@ -227,27 +91,22 @@ class OffsetPolarTransform:
 
     Methods
     -------
-    from_image(
-        image_shape,
-        num_angle=360,
-        num_radius=None,
-        center=None,
-        radius=None,
-        device="numpy"
-    ) -> OffsetPolarTransform
-        Class method to create an OffsetPolarTransform instance from image shape and
-        other associated parameters.
-    to_offset_polar(image, order=5, mode='constant', cval=0.0, **kwargs)
-        Warp a cartesian image to offset polar coordinates. Accepts 2D or 3D (batched)
-        images. By default, uses the maximum order-5 interpolation and constant zero
-        padding. Additional keyword arguments are passed to the warp function.
-    to_cartesian(image, order=5, mode='constant', cval=0.0, **kwargs)
-        Warp an offset polar image to cartesian coordinates. Accepts 2D or 3D (batched)
-        images. By default, uses the maximum order-5 interpolation and constant zero
-        padding. Additional keyword arguments are passed to the warp function.
+    from_image(image_shape, num_angle=360, num_radius=None, center=None, radius=None,
+               device="numpy") -> OffsetPolarTransform
+        Convenience constructor from image shape and polar geometry parameters.
+    to_transform_space(image, preserve_energy=True, **kwargs)
+        Warp a Cartesian image to offset polar coordinates (2D or batched 3D).
+    to_cartesian(image, preserve_energy=False, wrap_angular_axis=True, **kwargs)
+        Warp an offset polar image back to Cartesian coordinates.
     clear_cache()
-        Clear the cached coordinate mappings.
+        Release cached coordinate grids and Jacobian arrays.
     """
+
+    # --- CoordinateTransform class attributes ---
+    transform_name: str = "offset_polar"
+    supports_energy_preservation: bool = True
+    has_periodic_axis: bool = True
+    periodic_axis: int = 0  # angle axis is periodic
 
     def __init__(
         self,
@@ -470,52 +329,7 @@ class OffsetPolarTransform:
     # Public functions (and wrappers) for transformations
     # ============================================================================
 
-    def to_offset_polar(
-        self,
-        image: np.ndarray | torch.Tensor,
-        order: int = 5,
-        mode: str = "constant",
-        cval: float = 0.0,
-        preserve_energy: bool = True,
-        **kwargs: dict[Any, Any],
-    ) -> np.ndarray | torch.Tensor:
-        """Warp a cartesian image to offset polar coordinates.
-
-        NOTE: For CUDA device, image must be a PyTorch CUDA tensor on the same device
-        as the cached coordinates.
-        """
-        self._validate_device(image)
-
-        routed_result = self._apply_recursive_routing(
-            self.to_offset_polar,
-            image,
-            order=order,  # type: ignore
-            mode=mode,  # type: ignore
-            cval=cval,  # type: ignore
-            preserve_energy=preserve_energy,  # type: ignore
-            **kwargs,
-        )
-        if routed_result is not None:
-            return routed_result
-
-        # Case where the routed result is None --> have a single 2D real-valued image
-        source_coords = self._compute_cartesian_to_offset_polar_coords()
-        warped = self._warp_fn(
-            image,
-            source_coords,
-            output_shape=self.polar_shape,
-            order=order,
-            mode=mode,
-            cval=cval,
-            **kwargs,
-        )
-
-        if preserve_energy:
-            warped = self._apply_jacobian(warped, inverse=False)
-
-        return warped
-
-    def to_cartesian(
+    def to_cartesian(  # type: ignore[override]
         self,
         image: np.ndarray | torch.Tensor,
         order: int = 5,
@@ -587,3 +401,130 @@ class OffsetPolarTransform:
         )
 
         return warped
+
+    # ============================================================================
+    # CoordinateTransform interface implementation
+    # ============================================================================
+
+    def to_transform_space(
+        self,
+        image: np.ndarray | torch.Tensor,
+        order: int = 5,
+        mode: str = "constant",
+        cval: float = 0.0,
+        preserve_energy: bool = True,
+        **kwargs: Any,
+    ) -> np.ndarray | torch.Tensor:
+        """Warp a Cartesian image to offset polar coordinates.
+
+        Parameters
+        ----------
+        image : np.ndarray or torch.Tensor
+            Input 2-D or batched 3-D Cartesian image.
+        order : int, optional
+            Spline interpolation order. By default 5.
+        mode : str, optional
+            Boundary mode passed to the warp function. By default ``"constant"``.
+        cval : float, optional
+            Constant fill value when ``mode="constant"``. By default 0.0.
+        preserve_energy : bool, optional
+            Apply Jacobian correction to preserve total energy. By default True.
+        **kwargs
+            Additional arguments forwarded to the warp function.
+
+        Returns
+        -------
+        np.ndarray or torch.Tensor
+            Warped image in offset polar coordinates.
+        """
+        self._validate_device(image)
+
+        routed_result = self._apply_recursive_routing(
+            self.to_transform_space,
+            image,
+            order=order,  # type: ignore
+            mode=mode,  # type: ignore
+            cval=cval,  # type: ignore
+            preserve_energy=preserve_energy,  # type: ignore
+            **kwargs,
+        )
+        if routed_result is not None:
+            return routed_result
+
+        source_coords = self._compute_cartesian_to_offset_polar_coords()
+        warped = self._warp_fn(
+            image,
+            source_coords,
+            output_shape=self.polar_shape,
+            order=order,
+            mode=mode,
+            cval=cval,
+            **kwargs,
+        )
+
+        if preserve_energy:
+            warped = self._apply_jacobian(warped, inverse=False)
+
+        return warped
+
+    def jacobian_correction(self) -> np.ndarray:
+        """Per-radial-bin Jacobian (area-correction) factor.
+
+        Returns
+        -------
+        np.ndarray
+            1-D array of shape ``(num_radius,)`` with the square-root of the
+            Cartesian area covered by each polar pixel column.
+        """
+        jac = jacobian_correction_offset_polar(
+            self.num_angle, self.num_radius, self.radius
+        )
+        return np.sqrt(jac).astype(np.float32)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise geometric parameters to a JSON-serialisable dict.
+
+        Returns
+        -------
+        dict[str, Any]
+            Keys: ``transform_name``, ``center``, ``radius``,
+            ``num_angle``, ``num_radius``, ``height``, ``width``.
+        """
+        return {
+            "transform_name": self.transform_name,
+            "center": list(self.center),
+            "radius": float(self.radius),
+            "num_angle": int(self.num_angle),
+            "num_radius": int(self.num_radius),
+            "height": int(self.height),
+            "width": int(self.width),
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        params: dict[str, Any],
+        device: Literal["numpy"] | str | torch.device = "numpy",
+    ) -> "OffsetPolarTransform":
+        """Reconstruct an :class:`OffsetPolarTransform` from serialised parameters.
+
+        Parameters
+        ----------
+        params : dict[str, Any]
+            Dictionary produced by :meth:`to_dict`.
+        device : str | torch.device, optional
+            Computational device.  By default ``"numpy"`` (CPU).
+
+        Returns
+        -------
+        OffsetPolarTransform
+        """
+        return cls(
+            center=tuple(params["center"]),
+            radius=float(params["radius"]),
+            num_angle=int(params["num_angle"]),
+            num_radius=int(params["num_radius"]),
+            height=int(params["height"]),
+            width=int(params["width"]),
+            device=device,
+        )

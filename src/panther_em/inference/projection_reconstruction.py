@@ -4,7 +4,6 @@ import numpy as np
 import torch
 
 from panther_em.decomposition.result import DecompositionResult
-from panther_em.utils.warp_transforms import OffsetPolarTransform
 
 
 class ProjectionReconstructor:
@@ -13,28 +12,28 @@ class ProjectionReconstructor:
     def __init__(
         self,
         result: DecompositionResult,
-        image_shape: tuple[int, int],
         device: str | torch.device = "cpu",
     ) -> None:
+        if result.coordinate_transform is None:
+            raise ValueError("DecompositionResult must include a coordinate transform.")
+
         self.result = result
         self.device = torch.device(device)
-        self.image_shape = image_shape
 
+        # Reconstruct the transform on the requested device from serialized geometry.
         transform_device = self.device if self.device.type == "cuda" else "numpy"
-        self._polar_transform = OffsetPolarTransform.from_image(
-            image_shape=image_shape,
-            num_angle=result.num_angular_components,
-            num_radius=result.num_radial_components,
-            device=transform_device,
+        self._coordinate_transform = result.coordinate_transform.__class__.from_dict(
+            result.coordinate_transform.to_dict(), device=transform_device
         )
+        self.image_shape: tuple[int, int] = self._coordinate_transform.cartesian_shape
 
         self._U = torch.tensor(result.U, dtype=torch.complex64, device=self.device)
         self._S = torch.tensor(result.S, dtype=torch.complex64, device=self.device)
         self._Vh = torch.tensor(result.Vh, dtype=torch.complex64, device=self.device)
 
-    def clear_polar_transform_cache(self) -> None:
+    def clear_coordinate_transform_cache(self) -> None:
         """Remove any cached interpolation grids."""
-        self._polar_transform.clear_cache()
+        self._coordinate_transform.clear_cache()
 
     def _resolve_num_components(self, num_components: int | None) -> int:
         """Parse possible 'None' value for num_components and enforce max limit."""
@@ -82,7 +81,7 @@ class ProjectionReconstructor:
         N = self.result.num_angular_components
         n = torch.arange(N, device=self.device, dtype=torch.float32)
         base_angles = 2.0 * np.pi * k_idx * n / N
-        angles = base_angles + phase_shift_rad
+        angles = base_angles + k_idx * phase_shift_rad
 
         return torch.exp(1j * angles) / np.sqrt(N)
 
@@ -109,7 +108,7 @@ class ProjectionReconstructor:
         N = self.result.num_angular_components
         n = torch.arange(N, device=self.device, dtype=torch.float32)
         base_angles = 2.0 * np.pi * k_idx * n / N
-        angles = base_angles[None, :] + phase_shifts_rad[:, None]
+        angles = base_angles[None, :] + k_idx * phase_shifts_rad[:, None]
 
         return torch.exp(1j * angles) / np.sqrt(N)
 
@@ -204,7 +203,7 @@ class ProjectionReconstructor:
             k_idx, eig_idx, in_plane_rotation, return_torch=True
         )
 
-        cartesian_feature = self._polar_transform.to_cartesian(
+        cartesian_feature = self._coordinate_transform.to_cartesian(
             polar_feature,
             order=order,
             mode=mode,
@@ -332,7 +331,7 @@ class ProjectionReconstructor:
         if return_polar:
             return polar_projection if return_torch else polar_projection.cpu().numpy()
 
-        cartesian_projection = self._polar_transform.to_cartesian(
+        cartesian_projection = self._coordinate_transform.to_cartesian(
             polar_projection,
             order=order,
             mode=mode,
@@ -465,7 +464,7 @@ class ProjectionReconstructor:
                 polar_projections if return_torch else polar_projections.cpu().numpy()
             )
 
-        cartesian_projections = self._polar_transform.to_cartesian(
+        cartesian_projections = self._coordinate_transform.to_cartesian(
             polar_projections,
             order=order,
             mode=mode,
