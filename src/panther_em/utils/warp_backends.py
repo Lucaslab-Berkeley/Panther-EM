@@ -34,10 +34,6 @@ except ImportError:
 GPU_TRANSFORM_AVAILABLE = CUDA_AVAILABLE and CUCIM_AVAILABLE
 
 
-# TODO: Implement these as measure preserving mapping functions to ensure energy
-#       is preserved between polar and cartesian feature spaces. Should be a simple
-#       Jacobian correction factor based on the radius and angular sampling density.
-
 # ============================================================================
 # NumPy Backend (CPU)
 # ============================================================================
@@ -256,7 +252,8 @@ def get_warp_function(device: Literal["numpy"] | torch.device) -> Callable:
         return warp_torch_cuda
     else:
         raise ValueError(
-            f"Unsupported device: {device}. Supported: 'numpy' or torch.device('cuda[:index]')"
+            f"Unsupported device: {device}. "
+            "Supported: 'numpy' or torch.device('cuda[:index]')"
         )
 
 
