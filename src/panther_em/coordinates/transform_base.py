@@ -496,7 +496,7 @@ class CoordinateTransform(ABC):
     def to_cartesian(
         self,
         image: np.ndarray | torch.Tensor,
-        preserve_energy: bool = False,
+        preserve_energy: bool = True,
         wrap_angular_axis: bool = True,
         order: int = 5,
         mode: str = "constant",

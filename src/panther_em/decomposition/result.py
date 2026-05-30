@@ -277,15 +277,7 @@ class DecompositionResult:
     def save_top_n(self, path: str | Path, top_k: int) -> None:
         r"""Save only the ``top_k`` most significant components to HDF5.
 
-        Selects the ``top_k`` unique ``(k_stored, eig_idx)`` pairs ranked by
-        ``|S|`` and writes only the corresponding slices of ``U``, ``S``, and
-        ``Vh``.  The file is tagged ``is_sparse=True`` so :meth:`load`
-        transparently reconstructs full-shape zero-padded arrays, leaving all
-        downstream code (``get_top_n``, ``get_component``, ``compute_weights``,
-        etc.) unchanged.
-
-        File size is :math:`O(top\\_k)` rather than :math:`O(k\\_max \\times
-        eig\\_max)`.
+        Convenience wrapper for ``self.to_sparse(top_k).save(path)``.
 
         Parameters
         ----------
@@ -301,34 +293,69 @@ class DecompositionResult:
         """
         if top_k < 1:
             raise ValueError(f"top_k must be >= 1, got {top_k}")
+        self.to_sparse(top_k).save(path)
 
-        path = Path(path)
-        if path.suffix not in {".h5", ".hdf5"}:
-            path = path.with_suffix(".h5")
+    def to_dense(self) -> "DecompositionResult":
+        """Return self — already a dense result.
 
-        # include_negative=False gives unique stored pairs (no double-counting
-        # for real decompositions where ±k share the same stored row)
-        pairs = self.get_top_n(top_k, include_negative=False)
-        pairs = pairs[:top_k]
+        Returns
+        -------
+        DecompositionResult
+            This instance unchanged.
+        """
+        return self
 
+    def to_sparse(self, n: int) -> "SparseDecompositionResult":
+        """Create a SparseDecompositionResult keeping only the top-n components.
+
+        Parameters
+        ----------
+        n : int
+            Number of unique ``(k_stored, eig_idx)`` pairs to retain, ranked
+            by ``|S|``.
+
+        Returns
+        -------
+        SparseDecompositionResult
+            Compact representation storing only the n most significant
+            components.
+
+        Raises
+        ------
+        ValueError
+            If ``n < 1``.
+        """
+        if n < 1:
+            raise ValueError(f"n must be >= 1, got {n}")
+
+        pairs = self.get_top_n(n, include_negative=False)
+        pairs = pairs[:n]
         k_stored_arr = pairs[:, 0].astype(int)
         eig_idx_arr = pairs[:, 1].astype(int)
 
-        # Compact slices — shapes (num_ff, num_or, L), (L,), (L, num_r)
-        U_sparse = self.U[..., k_stored_arr, eig_idx_arr]
-        S_sparse = self.S[k_stored_arr, eig_idx_arr]
-        Vh_sparse = self.Vh[k_stored_arr, eig_idx_arr, :]
+        U_data = self.U[..., k_stored_arr, eig_idx_arr]
+        S_data = self.S[k_stored_arr, eig_idx_arr]
+        Vh_data = self.Vh[k_stored_arr, eig_idx_arr, :]
         selected_indices = np.stack([k_stored_arr, eig_idx_arr], axis=1)
 
-        with h5py.File(path, "w") as f:
-            f.attrs["is_sparse"] = True
-            self._write_hdf5_metadata(f)
-            f.create_dataset("selected_indices", data=selected_indices)
-            f.create_dataset("U", data=U_sparse)
-            f.create_dataset("S", data=S_sparse)
-            f.create_dataset("Vh", data=Vh_sparse)
-            self._write_hdf5_optional_arrays(f)
-            self._write_hdf5_transform_arrays(f)
+        return SparseDecompositionResult.from_sparse_arrays(
+            U_data=U_data,
+            S_data=S_data,
+            Vh_data=Vh_data,
+            selected_indices=selected_indices,
+            k_max=self.k_max,
+            eig_max=self.eig_max,
+            is_complex_projection=self.is_complex_projection,
+            num_fourier_filters=self.num_fourier_filters,
+            num_orientations=self.num_orientations,
+            num_angular_components=self.num_angular_components,
+            num_radial_components=self.num_radial_components,
+            coordinate_transform=self.coordinate_transform,
+            created_at=self.created_at,
+            phi_values=self.phi_values,
+            theta_values=self.theta_values,
+            fourier_filters=self.fourier_filters,
+        )
 
     @classmethod
     def load(cls, path: str | Path) -> "DecompositionResult":
@@ -347,27 +374,27 @@ class DecompositionResult:
         Raises
         ------
         ValueError
-            If the file extension is not ``.h5`` or ``.hdf5``.
+            If the file extension is not ``.h5`` or ``.hdf5``, or if the file
+            contains a sparse result (use :meth:`SparseDecompositionResult.load`
+            instead).
         """
         path = Path(path)
         if path.suffix not in {".h5", ".hdf5"}:
             raise ValueError(
                 f"Unknown file extension '{path.suffix}'. Expected '.h5' or '.hdf5'."
             )
+        with h5py.File(path, "r") as f:
+            if bool(f.attrs.get("is_sparse", False)):
+                raise ValueError(
+                    f"File '{path}' contains a sparse result. "
+                    "Use SparseDecompositionResult.load() instead."
+                )
         return cls._load_hdf5(path)
 
     @classmethod
     def _load_hdf5(cls, path: Path) -> "DecompositionResult":
-        """Load from an HDF5 file produced by :meth:`save` or :meth:`save_top_n`.
-
-        When the file was written by :meth:`save_top_n` (``is_sparse=True``
-        attribute present), the compact sparse arrays are scattered back into
-        full zero-padded dense arrays so that all downstream indexing code works
-        without modification.
-        """
+        """Load from an HDF5 file produced by :meth:`save`."""
         with h5py.File(path, "r") as f:
-            is_sparse = bool(f.attrs.get("is_sparse", False))
-
             k_max = int(f.attrs["k_max"])
             eig_max = int(f.attrs["eig_max"])
             is_complex = bool(f.attrs["is_complex_projection"])
@@ -428,32 +455,9 @@ class DecompositionResult:
             else:
                 coordinate_transform = reconstruct_transform(transform_params)
 
-            if is_sparse:
-                # Scatter compact arrays into zero-filled dense arrays so that
-                # all existing indexing (get_top_n, get_component, compute_weights)
-                # works without any downstream changes.
-                num_freq_blocks = k_max * 2 if is_complex else k_max
-                selected_indices = f["selected_indices"][()]  # (L, 2)
-                U_sparse = f["U"][()]  # (num_ff, num_or, L)
-                S_sparse = f["S"][()]  # (L,)
-                Vh_sparse = f["Vh"][()]  # (L, num_r)
-
-                k_stored_arr = selected_indices[:, 0]
-                eig_idx_arr = selected_indices[:, 1]
-
-                U = np.zeros(
-                    (num_ff, num_or, num_freq_blocks, eig_max), dtype=np.complex64
-                )
-                S = np.zeros((num_freq_blocks, eig_max), dtype=np.float32)
-                Vh = np.zeros((num_freq_blocks, eig_max, num_r), dtype=np.complex64)
-
-                U[..., k_stored_arr, eig_idx_arr] = U_sparse
-                S[k_stored_arr, eig_idx_arr] = S_sparse
-                Vh[k_stored_arr, eig_idx_arr, :] = Vh_sparse
-            else:
-                U = f["U"][()]
-                S = f["S"][()]
-                Vh = f["Vh"][()]
+            U = f["U"][()]
+            S = f["S"][()]
+            Vh = f["Vh"][()]
 
             return cls(
                 U=U,
@@ -705,3 +709,555 @@ class DecompositionResult:
         ax.set_xlabel("Number of Components")
         ax.set_ylabel("Cumulative Variance Explained")
         return fig, ax
+
+
+class SparseDecompositionResult(DecompositionResult):
+    """Sparse SVD result storing only the top-L most significant components.
+
+    Unlike :class:`DecompositionResult`, this class holds compact arrays of shape
+    ``(L,)`` / ``(num_ff, num_or, L)`` / ``(L, num_r)`` rather than full zero-padded
+    dense tensors. Memory scales with L, not with ``num_freq_blocks * eig_max``.
+
+    Attributes
+    ----------
+    num_stored : int
+        Number of ``(k_stored, eig_idx)`` pairs retained.
+    """
+
+    # Class-level annotations for private compact arrays (set by from_sparse_arrays).
+    _U_data: np.ndarray
+    _S_data: np.ndarray
+    _Vh_data: np.ndarray
+    _selected_indices: np.ndarray
+    _index_map: dict[tuple[int, int], int]
+    _top_n_cache: dict[tuple[int, bool], np.ndarray]
+
+    # Properties that raise rather than returning non-existent dense arrays.
+
+    @property
+    def U(self) -> np.ndarray:
+        """Not available — use get_component() or to_dense()."""
+        raise AttributeError(
+            "SparseDecompositionResult does not store the full U array. "
+            "Use get_component() to retrieve specific components, or "
+            "call to_dense() to materialize the full result."
+        )
+
+    @property
+    def S(self) -> np.ndarray:
+        """Not available — use get_component() or to_dense()."""
+        raise AttributeError(
+            "SparseDecompositionResult does not store the full S array. "
+            "Use get_component() or to_dense()."
+        )
+
+    @property
+    def Vh(self) -> np.ndarray:
+        """Not available — use get_component() or to_dense()."""
+        raise AttributeError(
+            "SparseDecompositionResult does not store the full Vh array. "
+            "Use get_component() to retrieve specific components, or "
+            "call to_dense() to materialize the full result."
+        )
+
+    @property
+    def num_stored(self) -> int:
+        """Number of (k_stored, eig_idx) pairs stored."""
+        return len(self._selected_indices)
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_sparse_arrays(
+        cls,
+        U_data: np.ndarray,
+        S_data: np.ndarray,
+        Vh_data: np.ndarray,
+        selected_indices: np.ndarray,
+        k_max: int,
+        eig_max: int,
+        is_complex_projection: bool,
+        num_fourier_filters: int,
+        num_orientations: int,
+        num_angular_components: int,
+        num_radial_components: int,
+        coordinate_transform: CoordinateTransform | None = None,
+        created_at: str | None = None,
+        phi_values: np.ndarray | None = None,
+        theta_values: np.ndarray | None = None,
+        fourier_filters: np.ndarray | None = None,
+    ) -> "SparseDecompositionResult":
+        """Construct from compact arrays.
+
+        Parameters
+        ----------
+        U_data : np.ndarray
+            Left singular vectors, shape ``(num_ff, num_or, L)``.
+        S_data : np.ndarray
+            Singular values, shape ``(L,)``.
+        Vh_data : np.ndarray
+            Right singular vectors, shape ``(L, num_r)``.
+        selected_indices : np.ndarray
+            ``(L, 2)`` integer array; column 0 = ``k_stored``,
+            column 1 = ``eig_idx``.
+        k_max : int
+            Maximum angular frequency index.
+        eig_max : int
+            Maximum radial eigenvalue index.
+        is_complex_projection : bool
+            Whether the underlying projection data is complex-valued.
+        num_fourier_filters : int
+            Number of Fourier filter channels.
+        num_orientations : int
+            Number of projection orientations.
+        num_angular_components : int
+            Number of angular components in polar space.
+        num_radial_components : int
+            Number of radial components in polar space.
+        coordinate_transform : CoordinateTransform | None, optional
+            Coordinate transform embedded at decomposition time.
+        created_at : str | None, optional
+            ISO timestamp; defaults to now if None.
+        phi_values : np.ndarray | None, optional
+            Phi Euler angles used during decomposition.
+        theta_values : np.ndarray | None, optional
+            Theta Euler angles used during decomposition.
+        fourier_filters : np.ndarray | None, optional
+            Fourier-space filters applied during decomposition.
+        """
+        obj: SparseDecompositionResult = object.__new__(cls)
+        obj.k_max = k_max
+        obj.eig_max = eig_max
+        obj.is_complex_projection = is_complex_projection
+        obj.num_fourier_filters = num_fourier_filters
+        obj.num_orientations = num_orientations
+        obj.num_angular_components = num_angular_components
+        obj.num_radial_components = num_radial_components
+        obj.coordinate_transform = coordinate_transform
+        obj.created_at = created_at or datetime.now().isoformat()
+        obj.phi_values = phi_values
+        obj.theta_values = theta_values
+        obj.fourier_filters = fourier_filters
+
+        obj._U_data = U_data
+        obj._S_data = S_data
+        obj._Vh_data = Vh_data
+        obj._selected_indices = selected_indices.astype(int)
+        obj._index_map = {
+            (int(k), int(e)): i for i, (k, e) in enumerate(obj._selected_indices)
+        }
+        obj._top_n_cache = {}
+        return obj
+
+    # ------------------------------------------------------------------
+    # Conversion
+    # ------------------------------------------------------------------
+
+    def to_dense(self) -> DecompositionResult:
+        """Scatter compact arrays into a full zero-padded DecompositionResult.
+
+        Returns
+        -------
+        DecompositionResult
+            Dense result with U/S/Vh of full shape; non-stored entries are
+            zero.
+        """
+        num_freq_blocks = self.k_max * 2 if self.is_complex_projection else self.k_max
+
+        k_stored_arr = self._selected_indices[:, 0]
+        eig_idx_arr = self._selected_indices[:, 1]
+
+        U_dense = np.zeros(
+            (
+                self.num_fourier_filters,
+                self.num_orientations,
+                num_freq_blocks,
+                self.eig_max,
+            ),
+            dtype=np.complex64,
+        )
+        S_dense = np.zeros((num_freq_blocks, self.eig_max), dtype=np.float32)
+        Vh_dense = np.zeros(
+            (num_freq_blocks, self.eig_max, self.num_radial_components),
+            dtype=np.complex64,
+        )
+
+        U_dense[..., k_stored_arr, eig_idx_arr] = self._U_data
+        S_dense[k_stored_arr, eig_idx_arr] = self._S_data
+        Vh_dense[k_stored_arr, eig_idx_arr, :] = self._Vh_data
+
+        return DecompositionResult(
+            U=U_dense,
+            S=S_dense,
+            Vh=Vh_dense,
+            k_max=self.k_max,
+            eig_max=self.eig_max,
+            is_complex_projection=self.is_complex_projection,
+            num_fourier_filters=self.num_fourier_filters,
+            num_orientations=self.num_orientations,
+            num_angular_components=self.num_angular_components,
+            num_radial_components=self.num_radial_components,
+            created_at=self.created_at,
+            phi_values=self.phi_values,
+            theta_values=self.theta_values,
+            fourier_filters=self.fourier_filters,
+            coordinate_transform=self.coordinate_transform,
+        )
+
+    def to_sparse(self, n: int) -> "SparseDecompositionResult":
+        """Return a new SparseDecompositionResult keeping only the top-n components.
+
+        Parameters
+        ----------
+        n : int
+            Number of ``(k_stored, eig_idx)`` pairs to retain. If ``n >= num_stored``
+            the current instance is returned unchanged.
+
+        Returns
+        -------
+        SparseDecompositionResult
+            Sub-selected sparse result.
+
+        Raises
+        ------
+        ValueError
+            If ``n < 1``.
+        """
+        if n < 1:
+            raise ValueError(f"n must be >= 1, got {n}")
+        if n >= self.num_stored:
+            return self
+
+        pairs = self.get_top_n(n, include_negative=False)
+        pairs = pairs[:n]
+        k_stored_arr = pairs[:, 0].astype(int)
+        eig_idx_arr = pairs[:, 1].astype(int)
+
+        compact_indices = np.array(
+            [
+                self._index_map[(int(k), int(e))]
+                for k, e in zip(k_stored_arr, eig_idx_arr, strict=False)
+            ]
+        )
+
+        return SparseDecompositionResult.from_sparse_arrays(
+            U_data=self._U_data[..., compact_indices],
+            S_data=self._S_data[compact_indices],
+            Vh_data=self._Vh_data[compact_indices],
+            selected_indices=self._selected_indices[compact_indices],
+            k_max=self.k_max,
+            eig_max=self.eig_max,
+            is_complex_projection=self.is_complex_projection,
+            num_fourier_filters=self.num_fourier_filters,
+            num_orientations=self.num_orientations,
+            num_angular_components=self.num_angular_components,
+            num_radial_components=self.num_radial_components,
+            coordinate_transform=self.coordinate_transform,
+            created_at=self.created_at,
+            phi_values=self.phi_values,
+            theta_values=self.theta_values,
+            fourier_filters=self.fourier_filters,
+        )
+
+    # ------------------------------------------------------------------
+    # Index helpers (override parent to work on compact arrays)
+    # ------------------------------------------------------------------
+
+    def get_component(
+        self,
+        k_idx: int | np.ndarray,
+        eig_idx: int | np.ndarray,
+        return_u: bool = True,
+        return_s: bool = True,
+        return_vh: bool = True,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+        """Retrieve specific SVD components from compact storage.
+
+        Pairs not present in the stored top-L set are returned as zeros, matching the
+        behavior of the dense result (those entries were truncated to zero when the
+        sparse result was created).
+
+        Parameters
+        ----------
+        k_idx : int | np.ndarray
+            Actual angular-frequency index or indices.
+        eig_idx : int | np.ndarray
+            Eigenvalue index or indices.
+        return_u, return_s, return_vh : bool
+            Which arrays to return; others are ``None``.
+
+        Returns
+        -------
+        tuple[np.ndarray | None, ...]
+            Same shape contract as :meth:`DecompositionResult.get_component`.
+        """
+        if not (return_u or return_s or return_vh):
+            raise ValueError(
+                "At least one of return_u, return_s, return_vh must be True."
+            )
+
+        k_idx_arr = np.atleast_1d(k_idx)
+        k_stored = np.atleast_1d(self.k_to_stored(k_idx_arr))
+        eig_idx_arr = np.atleast_1d(eig_idx)
+        conj_mask = np.atleast_1d(self.is_conjugate_mode(k_idx_arr))
+        L_query = len(k_stored)
+
+        compact_indices = np.array(
+            [
+                self._index_map.get((int(k), int(e)), -1)
+                for k, e in zip(k_stored, eig_idx_arr, strict=False)
+            ]
+        )
+        found = compact_indices >= 0
+
+        u = None
+        s = None
+        vh = None
+
+        if return_u:
+            u = np.zeros(
+                (self.num_fourier_filters, self.num_orientations, L_query),
+                dtype=np.complex64,
+            )
+            if found.any():
+                u[..., found] = self._U_data[..., compact_indices[found]]
+            if conj_mask.any():
+                u[..., conj_mask] = u[..., conj_mask].conj()
+
+        if return_s:
+            s = np.zeros(L_query, dtype=np.float32)
+            if found.any():
+                s[found] = self._S_data[compact_indices[found]]
+
+        if return_vh:
+            vh = np.zeros((L_query, self.num_radial_components), dtype=np.complex64)
+            if found.any():
+                vh[found] = self._Vh_data[compact_indices[found]]
+            if conj_mask.any():
+                vh[conj_mask] = vh[conj_mask].conj()
+
+        return u, s, vh
+
+    def get_top_n(self, top_k: int, include_negative: bool = True) -> np.ndarray:
+        """Get the top-n pairs from compact storage, ranked by ``|S|``.
+
+        When ``top_k`` exceeds the number of stored components all stored
+        pairs are returned without error.
+
+        Parameters
+        ----------
+        top_k : int
+            Number of pairs to return.
+        include_negative : bool, optional
+            For real-valued decompositions, whether to include negative-k
+            mirror pairs. Default is True.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(l, 2)`` array of ``(k_idx, eig_idx)`` pairs.
+        """
+        cache_key = (top_k, include_negative)
+        if cache_key not in self._top_n_cache:
+            sorted_l = np.argsort(np.abs(self._S_data))[::-1]
+            k_stored_sorted = self._selected_indices[sorted_l, 0]
+            eig_idx_sorted = self._selected_indices[sorted_l, 1]
+
+            if not self.is_complex_projection and include_negative:
+                tmp_k: list[int] = []
+                tmp_e: list[int] = []
+                for k_s, e in zip(k_stored_sorted, eig_idx_sorted, strict=False):
+                    if int(k_s) == 0:
+                        tmp_k.append(int(k_s))
+                        tmp_e.append(int(e))
+                    else:
+                        tmp_k.extend([int(k_s), -int(k_s)])
+                        tmp_e.extend([int(e), int(e)])
+                    if len(tmp_k) >= top_k:
+                        break
+                k_indices = np.array(tmp_k)[:top_k]
+                eig_indices = np.array(tmp_e)[:top_k]
+            else:
+                k_indices = k_stored_sorted[:top_k]
+                eig_indices = eig_idx_sorted[:top_k]
+
+            self._top_n_cache[cache_key] = np.stack((k_indices, eig_indices), axis=-1)
+
+        return self._top_n_cache[cache_key]
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save(self, path: str | Path) -> None:
+        """Save the sparse result to an HDF5 file.
+
+        The file is tagged ``is_sparse=True``. To load it back use
+        :meth:`SparseDecompositionResult.load`.
+
+        Parameters
+        ----------
+        path : str | Path
+            Destination path.  Extension is normalised to ``.h5``.
+        """
+        path = Path(path)
+        if path.suffix not in {".h5", ".hdf5"}:
+            path = path.with_suffix(".h5")
+
+        with h5py.File(path, "w") as f:
+            f.attrs["is_sparse"] = True
+            self._write_hdf5_metadata(f)
+            f.create_dataset("selected_indices", data=self._selected_indices)
+            f.create_dataset("U", data=self._U_data)
+            f.create_dataset("S", data=self._S_data)
+            f.create_dataset("Vh", data=self._Vh_data)
+            self._write_hdf5_optional_arrays(f)
+            self._write_hdf5_transform_arrays(f)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "SparseDecompositionResult":
+        """Load a sparse result from an HDF5 file written by :meth:`save`.
+
+        Parameters
+        ----------
+        path : str | Path
+            Path to the ``.h5`` or ``.hdf5`` file.
+
+        Returns
+        -------
+        SparseDecompositionResult
+            The loaded sparse result.
+
+        Raises
+        ------
+        ValueError
+            If the file extension is wrong, or the file does not contain a
+            sparse result (use :meth:`DecompositionResult.load` instead).
+        """
+        path = Path(path)
+        if path.suffix not in {".h5", ".hdf5"}:
+            raise ValueError(
+                f"Unknown file extension '{path.suffix}'. Expected '.h5' or '.hdf5'."
+            )
+
+        with h5py.File(path, "r") as f:
+            if not bool(f.attrs.get("is_sparse", False)):
+                raise ValueError(
+                    f"File '{path}' contains a dense result. "
+                    "Use DecompositionResult.load() instead."
+                )
+
+            k_max = int(f.attrs["k_max"])
+            eig_max = int(f.attrs["eig_max"])
+            is_complex = bool(f.attrs["is_complex_projection"])
+            num_ff = int(f.attrs["num_fourier_filters"])
+            num_or = int(f.attrs["num_orientations"])
+            num_ang = int(f.attrs["num_angular_components"])
+            num_r = int(f.attrs["num_radial_components"])
+
+            created_at = f.attrs["created_at"]
+            if isinstance(created_at, bytes):
+                created_at = created_at.decode("utf-8")
+
+            phi_values = f["phi_values"][()] if "phi_values" in f else None
+            theta_values = f["theta_values"][()] if "theta_values" in f else None
+            fourier_filters = (
+                f["fourier_filters"][()] if "fourier_filters" in f else None
+            )
+
+            if "transform_config" not in f.attrs:
+                raise KeyError(
+                    f"The file '{path}' has no 'transform_config' attribute."
+                )
+
+            transform_json = f.attrs["transform_config"]
+            if isinstance(transform_json, bytes):
+                transform_json = transform_json.decode("utf-8")
+            transform_params = json.loads(transform_json)
+
+            if transform_params.get("transform_name") == "grid":
+                transform_coords = f["transform/transform_coords"][()]
+                cartesian_coords = f["transform/cartesian_coords"][()]
+                jacobian = (
+                    f["transform/jacobian"][()] if "transform/jacobian" in f else None
+                )
+                polar_shape = (
+                    int(transform_params["polar_shape"][0]),
+                    int(transform_params["polar_shape"][1]),
+                )
+                cartesian_shape = (
+                    int(transform_params["cartesian_shape"][0]),
+                    int(transform_params["cartesian_shape"][1]),
+                )
+                coordinate_transform: CoordinateTransform = GridTransform.from_arrays(
+                    transform_coords=transform_coords,
+                    cartesian_coords=cartesian_coords,
+                    jacobian=jacobian,
+                    polar_shape=polar_shape,
+                    cartesian_shape=cartesian_shape,
+                    source_params=transform_params.get("source_params"),
+                    has_periodic_axis=bool(
+                        transform_params.get("has_periodic_axis", True)
+                    ),
+                    periodic_axis=int(transform_params.get("periodic_axis", 0)),
+                )
+            else:
+                coordinate_transform = reconstruct_transform(transform_params)
+
+            selected_indices = f["selected_indices"][()]
+            U_data = f["U"][()]
+            S_data = f["S"][()]
+            Vh_data = f["Vh"][()]
+
+        return cls.from_sparse_arrays(
+            U_data=U_data,
+            S_data=S_data,
+            Vh_data=Vh_data,
+            selected_indices=selected_indices,
+            k_max=k_max,
+            eig_max=eig_max,
+            is_complex_projection=is_complex,
+            num_fourier_filters=num_ff,
+            num_orientations=num_or,
+            num_angular_components=num_ang,
+            num_radial_components=num_r,
+            coordinate_transform=coordinate_transform,
+            created_at=created_at,
+            phi_values=phi_values,
+            theta_values=theta_values,
+            fourier_filters=fourier_filters,
+        )
+
+    # ------------------------------------------------------------------
+    # Display
+    # ------------------------------------------------------------------
+
+    def __repr__(self) -> str:
+        """Return a string representation showing sparsity info."""
+        num_freq_blocks = self.k_max * 2 if self.is_complex_projection else self.k_max
+        total = num_freq_blocks * self.eig_max
+        sparsity = f"{self.num_stored} / {total} ({100 * self.num_stored / total:.1f}%)"
+        transform_name = (
+            getattr(self.coordinate_transform, "transform_name", None)
+            if self.coordinate_transform is not None
+            else None
+        )
+        s = textwrap.dedent(f"""
+            SparseDecompositionResult(
+                k_max={self.k_max},
+                eig_max={self.eig_max},
+                is_complex_projection={self.is_complex_projection},
+                num_fourier_filters={self.num_fourier_filters},
+                num_orientations={self.num_orientations},
+                num_angular_components={self.num_angular_components},
+                num_radial_components={self.num_radial_components},
+                num_stored={sparsity},
+                has_euler_angles={self.phi_values is not None},
+                has_fourier_filters={self.fourier_filters is not None},
+                coordinate_transform='{transform_name}',
+                created_at='{self.created_at}'
+            )
+            """)
+        return s.strip()
