@@ -10,6 +10,7 @@ from typing import Any
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
 from panther_em.coordinates.transform_base import (
     CoordinateTransform,
@@ -617,6 +618,42 @@ class DecompositionResult:
                 vh[conj_mask] = vh[conj_mask].conj()
 
         return u, s, vh
+
+    def get_svd_tensors(
+        self,
+        indices: np.ndarray,
+        device: str | torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get device-allocated SVD tensors for the given ``(k_idx, eig_idx)`` pairs.
+
+        Delegates to :meth:`get_component` so dense and sparse results both work
+        correctly via polymorphism, including automatic conjugation for negative
+        ``k_idx`` in real-valued decompositions.
+
+        Parameters
+        ----------
+        indices : np.ndarray
+            Shape ``(L, 2)`` integer array; each row is ``(k_idx, eig_idx)``.
+        device : str or torch.device
+            Target device for the returned tensors.
+
+        Returns
+        -------
+        U : torch.Tensor
+            Left singular vectors, shape ``(FF, O, L)``, complex64.
+        S : torch.Tensor
+            Singular values, shape ``(L,)``, float32.
+        Vh : torch.Tensor
+            Right singular vectors, shape ``(L, R)``, complex64.
+        """
+        k_idx = indices[:, 0]
+        eig_idx = indices[:, 1]
+        U_np, S_np, Vh_np = self.get_component(k_idx, eig_idx)
+        return (
+            torch.tensor(U_np, dtype=torch.complex64, device=device),
+            torch.tensor(S_np, dtype=torch.float32, device=device),
+            torch.tensor(Vh_np, dtype=torch.complex64, device=device),
+        )
 
     # ------------------------------------------------------------------
     # Plotting helpers

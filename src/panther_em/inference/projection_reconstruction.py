@@ -24,17 +24,15 @@ class ProjectionReconstructor:
         self._coordinate_transform = result.coordinate_transform
         self.image_shape: tuple[int, int] = self._coordinate_transform.cartesian_shape
 
-        self._U = torch.tensor(result.U, dtype=torch.complex64, device=self.device)
-        self._S = torch.tensor(result.S, dtype=torch.complex64, device=self.device)
-        self._Vh = torch.tensor(result.Vh, dtype=torch.complex64, device=self.device)
-
     def clear_coordinate_transform_cache(self) -> None:
         """Remove any cached interpolation grids."""
         self._coordinate_transform.clear_cache()
 
     def _resolve_num_components(self, num_components: int | None) -> int:
         """Parse possible 'None' value for num_components and enforce max limit."""
-        max_components: int = self.result.S.shape[0] * self.result.eig_max
+        r = self.result
+        num_blocks = r.k_max * 2 if r.is_complex_projection else r.k_max
+        max_components = num_blocks * r.eig_max
 
         if num_components is None:
             return max_components
@@ -138,14 +136,10 @@ class ProjectionReconstructor:
             (num_angular_components, num_radial_components).
         """
         angular_component = self._get_angular_phase_component(k_idx, in_plane_rotation)
-        k_stored = self.result.k_to_stored(k_idx)
-        v_tensor = self._Vh[k_stored, eig_idx]
-
-        # Case of real-value and negative k_idx
-        if self.result.is_conjugate_mode(k_idx):
-            v_tensor = v_tensor.conj()
-
-        polar_feature = torch.outer(angular_component, v_tensor)
+        _, _, Vh = self.result.get_svd_tensors(
+            np.array([[k_idx, eig_idx]]), self.device
+        )
+        polar_feature = torch.outer(angular_component, Vh[0])
 
         return polar_feature if return_torch else polar_feature.cpu().numpy()
 
@@ -296,19 +290,13 @@ class ProjectionReconstructor:
             if not eig_indices:
                 continue
 
-            eig_idx_tensor = torch.tensor(eig_indices, device=self.device)
-            # k_idx is the actual angular frequency; convert to storage row.
-            k_stored = self.result.k_to_stored(k_idx)
-
-            u_ki = self._U[
-                fourier_filter_idx, orientation_idx, k_stored, eig_idx_tensor
-            ]
-            s_k = self._S[k_stored, eig_idx_tensor]
-            vh_k = self._Vh[k_stored, eig_idx_tensor]
-
-            # Mathematical reconstruction: U_ki * S_k * Vh_k
-            weighted_features = u_ki * s_k
-            radial_contribution = weighted_features @ vh_k
+            indices_np = np.column_stack(
+                [np.full(len(eig_indices), k_idx), eig_indices]
+            )
+            U_t, S_t, Vh_t = self.result.get_svd_tensors(indices_np, self.device)
+            u_ki = U_t[fourier_filter_idx, orientation_idx]  # (E,)
+            weighted_features = u_ki * S_t
+            radial_contribution = weighted_features @ Vh_t
 
             angular_component = self._get_angular_phase_component(
                 k_idx, in_plane_rotation
@@ -427,26 +415,18 @@ class ProjectionReconstructor:
             if not eig_indices:
                 continue
 
-            eig_idx_tensor = torch.tensor(eig_indices, device=self.device)
-            # k_idx is the actual angular frequency; convert to storage row.
-            k_stored = self.result.k_to_stored(k_idx)
-
+            indices_np = np.column_stack(
+                [np.full(len(eig_indices), k_idx), eig_indices]
+            )
             # angular_batch: (B, A)
             angular_batch = self._get_angular_phase_components_batch(
                 k_idx, phase_shifts
             )
 
-            # u_batch: (B, E) via broadcast indexing over orientation and ff axes
-            u_batch = self._U[
-                ff_batch[:, None],
-                orient_batch[:, None],
-                k_stored,
-                eig_idx_tensor[None, :],
-            ]
-            s_k = self._S[k_stored, eig_idx_tensor]  # (E,)
-            vh_k = self._Vh[k_stored, eig_idx_tensor]  # (E, R)
-
-            radial = (u_batch * s_k[None, :]) @ vh_k  # (B, R)
+            U_t, S_t, Vh_t = self.result.get_svd_tensors(indices_np, self.device)
+            # U_t: (FF, O, E); select one (ff, or) pair per batch element
+            u_batch = U_t[ff_batch, orient_batch, :]  # (B, E)
+            radial = (u_batch * S_t[None, :]) @ Vh_t  # (B, R)
             tmp_contribution = angular_batch[:, :, None] * radial[:, None, :]
             polar_projections += tmp_contribution
 

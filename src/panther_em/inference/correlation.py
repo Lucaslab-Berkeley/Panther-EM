@@ -87,7 +87,7 @@ def build_cartesian_kernels(
             return_torch=True,
             **polar_to_cart_kwargs,
         )
-        kernels.append(tmp)
+        kernels.append(torch.as_tensor(tmp, device=reconstructor.device))
 
     return torch.stack(kernels, dim=0)  # (N, kH, kW) complex64
 
@@ -347,11 +347,11 @@ def compute_correlogram(
             "No (k_idx, eig_idx) pairs were selected; cannot compute correlogram."
         )
 
-    # For real-valued: identify which components need a -k mirror contribution
-    # (everything except DC and, for even N, the Nyquist bin).
-    is_real = not result.is_complex_projection
-    N_angle = result.num_angular_components
-    nyquist_k = N_angle // 2 if (N_angle % 2 == 0) else None
+    # # For real-valued: identify which components need a -k mirror contribution
+    # # (everything except DC and, for even N, the Nyquist bin).
+    # is_real = not result.is_complex_projection
+    # N_angle = result.num_angular_components
+    # nyquist_k = N_angle // 2 if (N_angle % 2 == 0) else None
 
     # --- Stages 2 & 3: build kernels, correlate, contract (optionally chunked)
     effective_chunk = chunk_size if chunk_size is not None else N
@@ -370,15 +370,16 @@ def compute_correlogram(
         W_chunk_conj = W_chunk.conj()
         accumulator = accumulator + contract_features(W_chunk_conj, F_chunk)
 
-        # For real-valued, add the -k mirror contribution.
-        if is_real:
-            k_freqs = chunk_indices[:, 0]
-            mirror_mask = k_freqs > 0
-            if nyquist_k is not None:
-                mirror_mask = mirror_mask & (k_freqs != nyquist_k)
-            if mirror_mask.any():
-                W_mirror = W_chunk_conj * mirror_mask.to(dtype=W_chunk.dtype)
-                accumulator = accumulator + contract_features(W_mirror, F_chunk).conj()
+        # NOTE: Intentionally commented out since could just used 2*real after return
+        # # For real-valued, add the -k mirror contribution.
+        # if is_real:
+        #     k_freqs = chunk_indices[:, 0]
+        #     mirror_mask = k_freqs > 0
+        #     if nyquist_k is not None:
+        #         mirror_mask = mirror_mask & (k_freqs != nyquist_k)
+        #     if mirror_mask.any():
+        #         W_mirror = W_chunk_conj * mirror_mask.to(dtype=W_chunk.dtype)
+        #         accumulator += contract_features(W_mirror, F_chunk).conj()
 
     return accumulator
 
