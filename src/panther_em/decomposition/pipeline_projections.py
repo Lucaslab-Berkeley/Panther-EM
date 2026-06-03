@@ -291,6 +291,11 @@ def _compute_freq_crop(
         The resolved k_max value (after applying the None default).
     """
     if is_complex:
+        if num_angular_mode % 2 != 0:
+            raise ValueError(
+                "num_angular_mode must be even for complex projections in fftshifted storage; "
+                f"got num_angular_mode={num_angular_mode}"
+            )
         allowable = num_angular_mode // 2
         if k_max is None:
             k_max_actual = allowable

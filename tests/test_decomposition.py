@@ -38,13 +38,18 @@ def _make_result(is_complex: bool) -> DecompositionResult:
     """Minimal DecompositionResult with deterministic random arrays."""
     rng = np.random.default_rng(0)
     num_freq_blocks = K_MAX * 2 if is_complex else K_MAX
-    U = rng.standard_normal((NUM_FF, NUM_OR, num_freq_blocks, EIG_MAX)).astype(
-        np.complex64 if is_complex else np.float32
-    )
+
+    # Use complex arrays even for real-valued decompositions so conjugation paths are tested.
+    U = (
+        rng.standard_normal((NUM_FF, NUM_OR, num_freq_blocks, EIG_MAX)).astype(np.float32)
+        + 1j
+        * rng.standard_normal((NUM_FF, NUM_OR, num_freq_blocks, EIG_MAX)).astype(np.float32)
+    ).astype(np.complex64)
     S = rng.random((num_freq_blocks, EIG_MAX)).astype(np.float32)
-    Vh = rng.standard_normal((num_freq_blocks, EIG_MAX, NUM_R)).astype(
-        np.complex64 if is_complex else np.float32
-    )
+    Vh = (
+        rng.standard_normal((num_freq_blocks, EIG_MAX, NUM_R)).astype(np.float32)
+        + 1j * rng.standard_normal((num_freq_blocks, EIG_MAX, NUM_R)).astype(np.float32)
+    ).astype(np.complex64)
     transform = OffsetPolarTransform.from_image(
         image_shape=(64, 64),
         num_angle=NUM_ANG,
