@@ -11,6 +11,7 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 
+import panther_em.coordinates  # noqa: F401  # registers built-in transforms
 from panther_em.coordinates.transform_base import (
     CoordinateTransform,
     GridTransform,
@@ -829,7 +830,9 @@ class SparseDecompositionResult(DecompositionResult):
         """
         L = int(selected_indices.shape[0])
         if selected_indices.shape != (L, 2):
-            raise ValueError(f"selected_indices must have shape (L, 2), got {selected_indices.shape}")
+            raise ValueError(
+                f"selected_indices must have shape (L, 2), got {selected_indices.shape}"
+            )
         if S_data.shape != (L,) or Vh_data.shape[0] != L or U_data.shape[-1] != L:
             raise ValueError(
                 "Sparse arrays have inconsistent leading dimension L; expected "

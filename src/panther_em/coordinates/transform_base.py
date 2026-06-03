@@ -595,6 +595,7 @@ class CoordinateTransform(ABC):
                     "Periodic padding is only implemented for periodic_axis=0."
                 )
             pad_size = order
+            if device == "numpy":
                 image = np.pad(image, ((pad_size, pad_size), (0, 0)), mode="wrap")
             else:
                 image = image.unsqueeze(0)
