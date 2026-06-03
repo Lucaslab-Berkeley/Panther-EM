@@ -827,6 +827,15 @@ class SparseDecompositionResult(DecompositionResult):
         fourier_filters : np.ndarray | None, optional
             Fourier-space filters applied during decomposition.
         """
+        L = int(selected_indices.shape[0])
+        if selected_indices.shape != (L, 2):
+            raise ValueError(f"selected_indices must have shape (L, 2), got {selected_indices.shape}")
+        if S_data.shape != (L,) or Vh_data.shape[0] != L or U_data.shape[-1] != L:
+            raise ValueError(
+                "Sparse arrays have inconsistent leading dimension L; expected "
+                "S=(L,), Vh=(L, R), and U[..., L] to match selected_indices."
+            )
+
         obj: SparseDecompositionResult = object.__new__(cls)
         obj.k_max = k_max
         obj.eig_max = eig_max

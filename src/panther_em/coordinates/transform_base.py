@@ -511,7 +511,7 @@ class CoordinateTransform(ABC):
             Input 2-D image ``(num_angle, num_radius)`` or batched 3-D array.
         preserve_energy : bool, optional
             Remove the Jacobian scaling applied during the forward transform.
-            Default False.
+            Default True.
         wrap_angular_axis : bool, optional
             Apply circular padding at the 0°/360° boundary before warping.
             Only applied when :attr:`has_periodic_axis` is ``True``. Default True.
@@ -590,8 +590,11 @@ class CoordinateTransform(ABC):
         # Handle periodic angular axis to prevent boundary artifacts by wrap/circular
         # padding around the boundary before interpolation
         if wrap_angular_axis and self.has_periodic_axis:
+            if self.periodic_axis not in (None, 0):
+                raise NotImplementedError(
+                    "Periodic padding is only implemented for periodic_axis=0."
+                )
             pad_size = order
-            if device == "numpy":
                 image = np.pad(image, ((pad_size, pad_size), (0, 0)), mode="wrap")
             else:
                 image = image.unsqueeze(0)
