@@ -84,6 +84,12 @@ class PolarProjectionDecomposer:
             fourier_filters.to(self.device) if fourier_filters is not None else None
         )
 
+        if coordinate_transform.cartesian_shape != tuple(self.volume.shape[-2:]):
+            raise ValueError(
+                "coordinate_transform.cartesian_shape must match volume image shape "
+                f"{tuple(self.volume.shape[-2:])}, got {coordinate_transform.cartesian_shape}"
+            )
+
         self._coordinate_transform: CoordinateTransform = coordinate_transform
         self._result: DecompositionResult | None = None
 
