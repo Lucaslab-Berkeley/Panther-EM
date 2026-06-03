@@ -27,7 +27,7 @@ import tqdm
 from torch_fourier_slice.slice_extraction import extract_central_slices_rfft_3d
 from torch_fourier_slice.volume_utils import compute_cube_face_averages
 
-from panther_em.utils.warp_transforms import OffsetPolarTransform
+from panther_em.coordinates.transform_base import CoordinateTransform
 
 
 def precompute_volume_dft(
@@ -182,7 +182,7 @@ def process_batch(
     theta: torch.Tensor,
     psi: torch.Tensor,
     fourier_filters: torch.Tensor,
-    transformer: OffsetPolarTransform,
+    transformer: CoordinateTransform,
     warp_polar_kwargs: dict,
     fftfreq_max: float = 0.5,
 ) -> tuple[torch.Tensor, bool, int]:
@@ -202,10 +202,10 @@ def process_batch(
         Fourier space filters to apply. If shape (f, h, w // 2 + 1), then will be
         applied in real-mode. Can support complex-valued filters in real-space if
         shape is (f, h, w).
-    transformer : OffsetPolarTransform
+    transformer : CoordinateTransform
         Pre-initialized transformer for warping to polar coordinates.
     warp_polar_kwargs : dict
-        Additional kwargs for `warp_offset_polar`.
+        Additional kwargs forwarded to ``transformer.to_transform_space``.
     fftfreq_max : float
         Maximum frequency in cycles per pixel for Fourier slicing. Default is 0.5.
 
@@ -233,8 +233,7 @@ def process_batch(
 
     projections_filtered = apply_fourier_filters(projections, fourier_filters)
 
-    # warp_offset_polar expects only a single batch dimension, but have two batch dims.
-    # Create a temporary view to combine batch dimensions
+    # to_transform_space expects a single batch dimension; flatten the two outer dims.
     num_defocus = fourier_filters.shape[0]
     batch_size = phi.shape[0]
     projections_filtered_view = projections_filtered.view(
@@ -243,7 +242,7 @@ def process_batch(
         projections_filtered.shape[-1],
     )
 
-    projections_polar = transformer.to_offset_polar(
+    projections_polar = transformer.to_transform_space(
         projections_filtered_view,
         **warp_polar_kwargs,
     )
@@ -260,8 +259,9 @@ def process_batch(
     num_angular_mode = projections_polar_fft.shape[-2]
 
     # Reshape back to (num_defocus, batch_size, num_angle, num_radius)
+    num_radius = transformer.polar_shape[1]
     projections_polar_fft = projections_polar_fft.view(
-        num_defocus, batch_size, num_angular_mode, transformer.num_radius
+        num_defocus, batch_size, num_angular_mode, num_radius
     )
 
     return projections_polar_fft, is_complex, num_angular_mode
@@ -273,8 +273,7 @@ def do_pipelined_projection_and_transforms(
     theta: torch.Tensor,
     psi: torch.Tensor,
     fourier_filters: torch.Tensor | None,
-    num_angle: int,
-    num_radius: int,
+    transformer: CoordinateTransform,
     warp_polar_kwargs: dict,
     projection_batch_size: int = 128,
     pad_factor: float = 2.0,
@@ -291,12 +290,12 @@ def do_pipelined_projection_and_transforms(
         `(N,)` Euler angles in degrees.
     fourier_filters : torch.Tensor | None
         `(f, h, w // 2 + 1)` Fourier-space filters, or None for identity.
-    num_angle : int
-        Number of angular samples in polar projection.
-    num_radius : int
-        Number of radial samples in polar projection.
+    transformer : CoordinateTransform
+        Pre-initialised coordinate transform on the same device as ``volume``.
+        Provides the polar-space geometry (``polar_shape``) and the
+        ``to_transform_space`` warp method.
     warp_polar_kwargs : dict
-        Additional kwargs for `warp_offset_polar`.
+        Additional kwargs forwarded to ``transformer.to_transform_space``.
     projection_batch_size : int
         Orientations per GPU batch. Default is 128.
     pad_factor : float
@@ -314,8 +313,12 @@ def do_pipelined_projection_and_transforms(
         has been fft-shifted so that indices correspond to
         [-N/2, -N/2 + 1, ..., 0, 1, ..., N/2 - 1]. When real valued, corresponds to
         [0, 1, ..., N/2] frequencies.
+    bool
+        Whether the projections are complex-valued.
     """
     # TODO: check input shapes/types
+
+    num_radius = transformer.polar_shape[1]
 
     if fourier_filters is None:
         filter_shape = (
@@ -330,15 +333,6 @@ def do_pipelined_projection_and_transforms(
     # Precompute the 3D RFFT once — stays on GPU for the entire pipeline
     dft, volume_mean_scaled, pad_width = precompute_volume_dft(
         volume, pad_factor=pad_factor
-    )
-
-    # Initialize the coordinate transformer to use across batches
-    transform_device = volume.device if volume.is_cuda else "numpy"
-    transformer = OffsetPolarTransform.from_image(
-        image_shape=(volume.shape[1], volume.shape[2]),
-        num_angle=num_angle,
-        num_radius=num_radius,
-        device=transform_device,
     )
 
     # Free the original volume from GPU since we only need the DFT now

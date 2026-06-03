@@ -3,4 +3,4 @@
 from .polar_projection_decomposer import PolarProjectionDecomposer
 from .result import DecompositionResult
 
-__all__ = ["PolarProjectionDecomposer", "DecompositionResult"]
+__all__ = ["DecompositionResult", "PolarProjectionDecomposer"]
