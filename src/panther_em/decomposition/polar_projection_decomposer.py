@@ -87,7 +87,8 @@ class PolarProjectionDecomposer:
         if coordinate_transform.cartesian_shape != tuple(self.volume.shape[-2:]):
             raise ValueError(
                 "coordinate_transform.cartesian_shape must match volume image shape "
-                f"{tuple(self.volume.shape[-2:])}, got {coordinate_transform.cartesian_shape}"
+                f"{tuple(self.volume.shape[-2:])}, "
+                f"got {coordinate_transform.cartesian_shape}."
             )
 
         self._coordinate_transform: CoordinateTransform = coordinate_transform
@@ -180,7 +181,7 @@ class PolarProjectionDecomposer:
         transformer = self._coordinate_transform
 
         # Results generally too large to fit in GPU memory, so stored on CPU
-        polar_projections_transformed_cpu, is_complex = (
+        polar_projections_transformed_cpu, is_complex, k_max = (
             do_pipelined_projection_and_transforms(
                 volume=self.volume,
                 phi=self.phi_values,
@@ -190,6 +191,7 @@ class PolarProjectionDecomposer:
                 transformer=transformer,
                 warp_polar_kwargs={"preserve_energy": True},
                 projection_batch_size=projection_batch_size,
+                k_max=k_max,
             )
         )
 
@@ -205,33 +207,8 @@ class PolarProjectionDecomposer:
             batch_size, num_angular_mode, num_radius
         )
 
-        # Validate and select frequency block range
-        # NOTE: For complex projection data (when `is_complex=True`) frequency blocks
-        #       are stored in fftshifted order ranging from -k_max to +k_max. Select
-        #       block indices accordingly
-        if is_complex:
-            allowable_k_max = num_angular_mode // 2
-            if k_max is None:
-                k_max = allowable_k_max
-            elif k_max < 1 or k_max > allowable_k_max:
-                raise ValueError(
-                    f"k_max must be in [1, {allowable_k_max}] for complex projection "
-                    f"data with num_angular_mode={num_angular_mode}, got k_max={k_max}"
-                )
-            dc_data_index = num_angular_mode // 2
-            block_index_min = dc_data_index - k_max
-            block_index_max = dc_data_index + k_max
-        else:
-            allowable_k_max = num_angular_mode
-            if k_max is None:
-                k_max = allowable_k_max
-            elif k_max < 1 or k_max > allowable_k_max:
-                raise ValueError(
-                    f"k_max must be in [1, {allowable_k_max}] for real projection "
-                    f"data with num_angular_mode={num_angular_mode}, got k_max={k_max}"
-                )
-            block_index_min = 0
-            block_index_max = k_max
+        # Stored tensor is already cropped to k_max by the pipeline; iterate all blocks.
+        num_freq_block = num_angular_mode
 
         if eig_max is None:
             eig_max = num_radius
@@ -240,8 +217,6 @@ class PolarProjectionDecomposer:
                 f"eig_max must be in the range [1, {num_radius}] "
                 f"for num_radius={num_radius}, got eig_max={eig_max}"
             )
-
-        num_freq_block = block_index_max - block_index_min
 
         # Allocate tensors for the SVD results on CPU
         U = torch.zeros(
@@ -254,7 +229,7 @@ class PolarProjectionDecomposer:
             device="cpu",
         )
 
-        block_index_range = range(block_index_min, block_index_max, block_batch_size)
+        block_index_range = range(0, num_freq_block, block_batch_size)
         for k_result_start in tqdm.tqdm(block_index_range, desc="decomp freq blocks"):
             k_result_end = min(k_result_start + block_batch_size, num_freq_block)
             num_k_batch = k_result_end - k_result_start
