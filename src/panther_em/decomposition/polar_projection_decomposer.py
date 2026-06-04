@@ -1,6 +1,7 @@
 """Polar projection decomposition for cryo-EM volumes."""
 
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
@@ -145,13 +146,15 @@ class PolarProjectionDecomposer:
         eig_max: int | None = None,
         projection_batch_size: int = 128,
         block_batch_size: int = 8,
+        storage_backend: Literal["on_device", "cpu", "mmap"] = "cpu",
+        mmap_path: Path | str | None = None,
     ) -> DecompositionResult:
         """Run the block-circulant decomposition using the held orientations.
 
         NOTE: Computation is split into two stages: 1) on-the-fly projection generation
         plus FFT transformation 2) block-wise SVD decomposition. A barrier exists
-        between these two stages, and intermediate results from (1) are stored on CPU
-        memory to support problem size scaling.
+        between these two stages, and intermediate results from (1) are stored
+        according to ``storage_backend``.
 
         Parameters
         ----------
@@ -169,6 +172,16 @@ class PolarProjectionDecomposer:
         block_batch_size : int, optional
             Number of frequency blocks to process at a time on GPU for SVD.
             Default is 8.
+        storage_backend : {"on_device", "cpu", "mmap"}, optional
+            Where to accumulate Stage 1 results:
+
+            * ``"on_device"`` — keep on the compute device; fastest when VRAM allows.
+            * ``"cpu"`` — pageable CPU RAM via synchronous D2H copies (default).
+            * ``"mmap"`` — memory-mapped file on disk; use when buffer exceeds RAM.
+              Requires ``mmap_path``.
+        mmap_path : Path | str | None, optional
+            Path for the memory-mapped intermediate file. Required when
+            ``storage_backend="mmap"``. Default is None.
 
         Returns
         -------
@@ -180,7 +193,6 @@ class PolarProjectionDecomposer:
         # Transforms are device-agnostic; GPU dispatch is handled internally.
         transformer = self._coordinate_transform
 
-        # Results generally too large to fit in GPU memory, so stored on CPU
         polar_projections_transformed_cpu, is_complex, k_max = (
             do_pipelined_projection_and_transforms(
                 volume=self.volume,
@@ -192,6 +204,8 @@ class PolarProjectionDecomposer:
                 warp_polar_kwargs={"preserve_energy": True},
                 projection_batch_size=projection_batch_size,
                 k_max=k_max,
+                storage_backend=storage_backend,
+                mmap_path=mmap_path,
             )
         )
 

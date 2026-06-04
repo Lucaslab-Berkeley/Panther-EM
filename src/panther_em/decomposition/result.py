@@ -12,12 +12,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from panther_em.coordinates.transform_base import (
-    CoordinateTransform,
-    GridTransform,
-    reconstruct_transform,
-)
-
 import panther_em.coordinates  # noqa: F401  # registers built-in transforms
 from panther_em.coordinates.transform_base import (
     CoordinateTransform,
@@ -260,9 +254,8 @@ class DecompositionResult:
     def save(self, path: str | Path) -> None:
         """Save the full decomposition result to an HDF5 file.
 
-        Scalar metadata is stored as root-level HDF5 attributes.  To save only
-        the most significant components and reduce file size, use
-        :meth:`save_top_n` instead.
+        Scalar metadata is stored as root-level HDF5 attributes.  To save only the most
+        significant components and reduce file size, use :meth:`save_top_n` instead.
 
         Parameters
         ----------

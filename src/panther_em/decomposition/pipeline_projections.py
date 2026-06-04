@@ -20,6 +20,11 @@ pipeline for this stage of computation:
 8. Repeat for next batch until all projections are processed.
 """
 
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Literal
+
+import numpy as np
 import roma
 import torch
 import torch.nn.functional as F
@@ -293,8 +298,8 @@ def _compute_freq_crop(
     if is_complex:
         if num_angular_mode % 2 != 0:
             raise ValueError(
-                "num_angular_mode must be even for complex projections in fftshifted storage; "
-                f"got num_angular_mode={num_angular_mode}"
+                "num_angular_mode must be even for complex projections in fftshifted "
+                f"storage; got num_angular_mode={num_angular_mode}"
             )
         allowable = num_angular_mode // 2
         if k_max is None:
@@ -326,6 +331,93 @@ def _compute_freq_crop(
     return block_index_min, block_index_max, k_max_actual
 
 
+class _ProjectionBuffer(ABC):
+    """Abstract accumulation buffer for staged polar-projection results."""
+
+    @abstractmethod
+    def write_batch(
+        self,
+        gpu_result: torch.Tensor,
+        dest_slice: slice,
+    ) -> None:
+        """Accept one batch of GPU results and write to the output buffer.
+
+        Parameters
+        ----------
+        gpu_result : torch.Tensor
+            `(F, B, num_angular_mode, num_radius)` complex64 tensor on the compute
+            device.
+        dest_slice : slice
+            Orientation-axis slice into the full output buffer.
+        """
+
+    @abstractmethod
+    def finalize(self) -> torch.Tensor:
+        """Block until all writes are complete and return the filled buffer."""
+
+
+class _OnDeviceBuffer(_ProjectionBuffer):
+    """Keep accumulation tensor on the compute device; no D2H transfer."""
+
+    def __init__(
+        self,
+        buffer_shape: tuple[int, ...],
+        block_index_min: int,
+        block_index_max: int,
+        device: torch.device,
+    ) -> None:
+        self._output = torch.empty(buffer_shape, dtype=torch.complex64, device=device)
+        self._block_index_min = block_index_min
+        self._block_index_max = block_index_max
+
+    def write_batch(
+        self,
+        gpu_result: torch.Tensor,
+        dest_slice: slice,
+    ) -> None:
+        bmin, bmax = self._block_index_min, self._block_index_max
+        self._output[:, dest_slice] = gpu_result[:, :, bmin:bmax, :]
+
+    def finalize(self) -> torch.Tensor:
+        if self._output.is_cuda:
+            torch.cuda.synchronize(self._output.device)
+        return self._output
+
+
+class _HostStagingBuffer(_ProjectionBuffer):
+    """Synchronous D2H copy: GPU result → host destination (pageable or mmap).
+
+    Parameters
+    ----------
+    output_tensor : torch.Tensor
+        Pre-allocated destination tensor (pageable CPU or ``torch.from_numpy``
+        view of a ``np.memmap``).
+    block_index_min, block_index_max : int
+        Angular-frequency crop indices (fixed for the lifetime of the buffer).
+    """
+
+    def __init__(
+        self,
+        output_tensor: torch.Tensor,
+        block_index_min: int,
+        block_index_max: int,
+    ) -> None:
+        self._output = output_tensor
+        self._block_index_min = block_index_min
+        self._block_index_max = block_index_max
+
+    def write_batch(
+        self,
+        gpu_result: torch.Tensor,
+        dest_slice: slice,
+    ) -> None:
+        bmin, bmax = self._block_index_min, self._block_index_max
+        self._output[:, dest_slice].copy_(gpu_result[:, :, bmin:bmax, :])
+
+    def finalize(self) -> torch.Tensor:
+        return self._output
+
+
 def do_pipelined_projection_and_transforms(
     volume: torch.Tensor,
     phi: torch.Tensor,
@@ -339,6 +431,8 @@ def do_pipelined_projection_and_transforms(
     fftfreq_max: float = 0.5,
     show_progress: bool = True,
     k_max: int | None = None,
+    storage_backend: Literal["on_device", "cpu", "mmap"] = "cpu",
+    mmap_path: Path | str | None = None,
 ) -> tuple[torch.Tensor, bool, int]:
     """Pipelined generation and transforms of projections in polar coordinates.
 
@@ -367,23 +461,39 @@ def do_pipelined_projection_and_transforms(
     k_max : int | None
         Maximum angular frequency index to store. Only the ``k_max`` lowest-index
         blocks (real-valued projections) or the ``2 * k_max`` blocks centred on DC
-        (complex-valued) are written to the CPU buffer. None stores all blocks.
+        (complex-valued) are written to the output buffer. None stores all blocks.
         Default is None.
+    storage_backend : {"on_device", "cpu", "mmap"}
+        Where to accumulate results:
+
+        * ``"on_device"`` — keep the full buffer on the compute device (GPU).
+          Fastest when VRAM is sufficient to hold all projections.
+        * ``"cpu"`` — accumulate to a pageable CPU tensor via synchronous D2H
+          copies after each batch.  Default.
+        * ``"mmap"`` — same as ``"cpu"`` but the destination is a
+          ``numpy.memmap``-backed file; use when the buffer exceeds RAM.
+          Requires ``mmap_path``.
+    mmap_path : Path | str | None
+        Path for the memory-mapped intermediate file.  Required when
+        ``storage_backend="mmap"``, ignored otherwise.  The file is created (or
+        overwritten) in ``'w+'`` mode as a raw complex64 array.
 
     Returns
     -------
     torch.Tensor
         `(num_fourier_filters, num_projections, num_freq_block, num_radius)`
-        complex64 tensor on CPU. When underlying projections are complex, angular dim
-        has been fft-shifted so that indices correspond to
-        ``[-k_max, ..., 0, ..., k_max - 1]``. When real valued, corresponds to
-        ``[0, 1, ..., k_max - 1]`` frequencies.
+        complex64 tensor.  Resides on the compute device when
+        ``storage_backend="on_device"``, on CPU otherwise.  When underlying
+        projections are complex, the angular dim has been fft-shifted so that
+        indices correspond to ``[-k_max, ..., 0, ..., k_max - 1]``; for real
+        projections it corresponds to ``[0, 1, ..., k_max - 1]``.
     bool
         Whether the projections are complex-valued.
     int
         The resolved ``k_max`` value actually used.
     """
-    # TODO: check input shapes/types
+    if storage_backend == "mmap" and mmap_path is None:
+        raise ValueError("mmap_path must be provided when storage_backend='mmap'")
 
     num_radius = transformer.polar_shape[1]
 
@@ -396,6 +506,8 @@ def do_pipelined_projection_and_transforms(
         fourier_filters = torch.ones(
             filter_shape, device=volume.device, dtype=torch.complex64
         )
+
+    compute_device = volume.device
 
     # Precompute the 3D RFFT once — stays on GPU for the entire pipeline
     dft, volume_mean_scaled, pad_width = precompute_volume_dft(
@@ -425,15 +537,21 @@ def do_pipelined_projection_and_transforms(
     )
     num_freq_block = block_index_max - block_index_min
 
-    # Allocate memory on CPU for cropped storage
     num_orientations = phi.shape[0]
     num_filters = fourier_filters.shape[0]
-    polar_projections_transformed_cpu = torch.empty(
-        (num_filters, num_orientations, num_freq_block, num_radius),
-        dtype=torch.complex64,
-        device="cpu",
-        pin_memory=False,
-    )
+    buffer_shape = (num_filters, num_orientations, num_freq_block, num_radius)
+
+    if storage_backend == "on_device":
+        buffer: _ProjectionBuffer = _OnDeviceBuffer(
+            buffer_shape, block_index_min, block_index_max, compute_device
+        )
+    elif storage_backend == "cpu":
+        output_tensor = torch.empty(buffer_shape, dtype=torch.complex64, device="cpu")
+        buffer = _HostStagingBuffer(output_tensor, block_index_min, block_index_max)
+    else:  # "mmap"
+        _mm = np.memmap(mmap_path, dtype=np.complex64, mode="w+", shape=buffer_shape)
+        output_tensor = torch.from_numpy(_mm)
+        buffer = _HostStagingBuffer(output_tensor, block_index_min, block_index_max)
 
     pbar = None
     if show_progress:
@@ -441,6 +559,7 @@ def do_pipelined_projection_and_transforms(
             total=num_orientations,
             desc="calc. projections",
             unit="proj",
+            unit_scale=num_filters,
         )
 
     for start_idx in range(0, num_orientations, projection_batch_size):
@@ -448,7 +567,7 @@ def do_pipelined_projection_and_transforms(
         slice_ = slice(start_idx, end_idx)
         batch_size = end_idx - start_idx
 
-        projections_polar_fft, is_complex, _ = process_batch(
+        result, is_complex, _ = process_batch(
             dft=dft,
             volume_mean_scaled=volume_mean_scaled,
             pad_width=pad_width,
@@ -462,14 +581,10 @@ def do_pipelined_projection_and_transforms(
         )
 
         if is_complex:
-            projections_polar_fft = torch.fft.fftshift(projections_polar_fft, dim=-3)
+            result = torch.fft.fftshift(result, dim=-3)
 
-        # Copy to CPU, cropping to the requested k_max window
-        polar_projections_transformed_cpu[:, slice_].copy_(
-            projections_polar_fft[:, :, block_index_min:block_index_max, :],
-            non_blocking=True,
-        )
-        del projections_polar_fft
+        buffer.write_batch(result, slice_)
+        del result
 
         if pbar is not None:
             pbar.update(batch_size)
@@ -477,10 +592,7 @@ def do_pipelined_projection_and_transforms(
     if pbar is not None:
         pbar.close()
 
-    # Ensure all async copies are complete before returning
-    if dft.is_cuda:
-        torch.cuda.synchronize(dft.device)
-
     del dft
 
-    return polar_projections_transformed_cpu, is_complex, k_max_actual
+    output = buffer.finalize()
+    return output, is_complex, k_max_actual
