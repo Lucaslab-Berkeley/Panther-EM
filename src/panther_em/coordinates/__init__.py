@@ -8,6 +8,7 @@ transform implementations.
 # from .nonuniform_polar import NonUniformPolarTransform
 # # TODO: add nonuniform_polar.py before exporting
 from .offset_polar import OffsetPolarTransform
+from .spiral_polar import SpiralPolarTransform
 from .standard_polar import StandardPolarTransform
 from .transform_base import (
     CoordinateTransform,
@@ -23,6 +24,7 @@ __all__ = [
     "GridTransform",
     # "NonUniformPolarTransform",  # TODO: enable when implemented
     "OffsetPolarTransform",
+    "SpiralPolarTransform",
     "StandardPolarTransform",
     "get_transform",
     "get_transform_class",
