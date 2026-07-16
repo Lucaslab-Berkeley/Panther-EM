@@ -5,8 +5,10 @@ transform implementations.
 """
 
 # Import built-in transforms to trigger @register_transform
-# from .nonuniform_polar import NonUniformPolarTransform  # TODO: add nonuniform_polar.py before exporting
+# from .nonuniform_polar import NonUniformPolarTransform
+# # TODO: add nonuniform_polar.py before exporting
 from .offset_polar import OffsetPolarTransform
+from .standard_polar import StandardPolarTransform
 from .transform_base import (
     CoordinateTransform,
     GridTransform,
@@ -21,6 +23,7 @@ __all__ = [
     "GridTransform",
     # "NonUniformPolarTransform",  # TODO: enable when implemented
     "OffsetPolarTransform",
+    "StandardPolarTransform",
     "get_transform",
     "get_transform_class",
     "reconstruct_transform",
