@@ -16,11 +16,13 @@ Symbols
     Number of angular samples -- equivalently, the number of spiral "arms".
 ``n_r`` = ``num_radius``
     Number of radial samples per arm.
-``s`` = ``spacing_ratio_relative_to_cartesian``
-    Target ratio of the longest spacing between neighbouring spiral nodes to the
-    spacing of a reference ``height x width`` Cartesian grid. Smaller values pack
-    nodes more tightly (denser sampling); ``s=1`` roughly matches Cartesian-grid
-    spacing. Default 0.8.
+``c``
+    Free scalar parameter (dimensionless, defined relative to ``r_max`` -- see the
+    radial profile below) controlling the transition from linear to square-root
+    radial growth. Small ``c`` (near 0) gives a nearly pure square-root radial
+    profile (denser sampling near the center, matching equal-area polar sampling);
+    large ``c`` approaches uniform (linear) radial spacing, as in a standard polar
+    grid. Must be ``> 0``. Default 0.3.
 ``p_o`` = ``percent_arc_offset``
     Fraction of a full turn (``2*pi / n_a``) that the spiral rotates for each
     radial step outward. Default 0.322.
@@ -29,14 +31,11 @@ Derived constants
 ------------------
 ::
 
-    n_r' = n_r + 1
-    p    = r_max / (sqrt(2) * s * n_r')
-    c    = p / (2 * (1 - p))
     t_max = 0.5 * (1 + 2 * c)
-    dt   = t_max / n_r
+    dt    = t_max / n_r
 
-``c`` controls the transition from linear to square-root radial growth; ``dt`` is
-the step size of a uniform parameter ``t`` from which physical radii are derived.
+``dt`` is the step size of a uniform parameter ``t`` from which physical radii are
+derived.
 
 Radial profile
 ---------------
@@ -80,10 +79,9 @@ from .transform_base import CoordinateTransform, get_transform, register_transfo
 def _spiral_geometry(
     num_angle: int,
     num_radius: int,
-    max_radius: float,
-    spacing_ratio_relative_to_cartesian: float,
+    c: float,
     percent_arc_offset: float,
-) -> tuple[float, float, float]:
+) -> tuple[float, float]:
     """Derive the scalar geometry parameters shared by all spiral mapping functions.
 
     Parameters
@@ -92,18 +90,14 @@ def _spiral_geometry(
         Number of angular samples (spiral arms).
     num_radius : int
         Number of radial samples per arm.
-    max_radius : float
-        Maximum radius for the polar coordinate system.
-    spacing_ratio_relative_to_cartesian : float
-        Target ratio of longest spiral-node spacing to a reference Cartesian
-        grid's spacing. Must be in ``(0, 1)``.
+    c : float
+        Free linear-to-sqrt growth transition parameter; see module docstring.
+        Must be ``> 0``.
     percent_arc_offset : float
         Fraction of a full turn the spiral rotates per outward radial step.
 
     Returns
     -------
-    c : float
-        Linear-to-sqrt growth transition parameter.
     dt : float
         Step size of the uniform radial parameter ``t``.
     twist_rate : float
@@ -112,28 +106,17 @@ def _spiral_geometry(
     Raises
     ------
     ValueError
-        If ``spacing_ratio_relative_to_cartesian`` yields a degenerate (non-finite
-        or non-positive) transition parameter ``c``.
+        If ``c`` is not strictly positive.
     """
-    n_radial_values = num_radius + 1
-    p = max_radius / (
-        np.sqrt(2) * spacing_ratio_relative_to_cartesian * n_radial_values
-    )
-    if not (0.0 < p < 1.0):
-        raise ValueError(
-            "spacing_ratio_relative_to_cartesian must yield p = max_radius / "
-            "(sqrt(2) * spacing_ratio_relative_to_cartesian * (num_radius + 1)) "
-            f"in (0, 1); got p={p}. Try increasing spacing_ratio_relative_to_cartesian "
-            "or num_radius."
-        )
-    c = p / (2 * (1 - p))
+    if c <= 0:
+        raise ValueError(f"c must be > 0 for a valid radial profile; got c={c}.")
 
     t_max = 0.5 * (1 + 2 * c)
     dt = t_max / num_radius
 
     twist_rate = percent_arc_offset * 2 * np.pi / (num_angle * dt)
 
-    return c, dt, twist_rate
+    return dt, twist_rate
 
 
 def _radius_from_t(t: np.ndarray, max_radius: float, c: float) -> np.ndarray:
@@ -157,7 +140,7 @@ def forward_cartesian_to_spiral_polar_mapping(
     num_radius: int,
     max_radius: float,
     center: tuple[float, float],
-    spacing_ratio_relative_to_cartesian: float = 0.8,
+    c: float = 0.3,
     percent_arc_offset: float = 0.322,
 ) -> np.ndarray:
     """The forward mapping function to take cartesian coords to spiral polar coords.
@@ -174,8 +157,9 @@ def forward_cartesian_to_spiral_polar_mapping(
         Maximum radius for the polar coordinate system.
     center : tuple[float, float]
         Center point (row, col) of the polar coordinate system.
-    spacing_ratio_relative_to_cartesian : float, optional
-        Target node-spacing ratio; see module docstring. Default 0.8.
+    c : float, optional
+        Free linear-to-sqrt growth transition parameter; see module docstring.
+        Must be ``> 0``. Default 0.3.
     percent_arc_offset : float, optional
         Fraction of a full turn rotated per radial step; see module docstring.
         Default 0.322.
@@ -192,13 +176,7 @@ def forward_cartesian_to_spiral_polar_mapping(
     angle = np.arctan2(row, col)
     angle = angle % (2 * np.pi)
 
-    c, dt, twist_rate = _spiral_geometry(
-        num_angle,
-        num_radius,
-        max_radius,
-        spacing_ratio_relative_to_cartesian,
-        percent_arc_offset,
-    )
+    dt, twist_rate = _spiral_geometry(num_angle, num_radius, c, percent_arc_offset)
 
     t = _t_from_radius(radius, max_radius, c)
     radius_idx = t / dt - 1
@@ -215,7 +193,7 @@ def forward_spiral_polar_to_cartesian_mapping(
     num_radius: int,
     max_radius: float,
     center: tuple[float, float],
-    spacing_ratio_relative_to_cartesian: float = 0.8,
+    c: float = 0.3,
     percent_arc_offset: float = 0.322,
 ) -> np.ndarray:
     """Forward mapping: Spiral polar coordinates -> Cartesian coordinates.
@@ -232,8 +210,9 @@ def forward_spiral_polar_to_cartesian_mapping(
         Maximum radius for the polar coordinate system.
     center : tuple[float, float]
         Center point (row, col) of the polar coordinate system.
-    spacing_ratio_relative_to_cartesian : float, optional
-        Target node-spacing ratio; see module docstring. Default 0.8.
+    c : float, optional
+        Free linear-to-sqrt growth transition parameter; see module docstring.
+        Must be ``> 0``. Default 0.3.
     percent_arc_offset : float, optional
         Fraction of a full turn rotated per radial step; see module docstring.
         Default 0.322.
@@ -246,13 +225,7 @@ def forward_spiral_polar_to_cartesian_mapping(
     radius_idx = input_coords[:, 0]
     angle_idx = input_coords[:, 1]
 
-    c, dt, twist_rate = _spiral_geometry(
-        num_angle,
-        num_radius,
-        max_radius,
-        spacing_ratio_relative_to_cartesian,
-        percent_arc_offset,
-    )
+    dt, twist_rate = _spiral_geometry(num_angle, num_radius, c, percent_arc_offset)
 
     t = (radius_idx + 1) * dt
     radius = _radius_from_t(t, max_radius, c)
@@ -272,7 +245,7 @@ def inverse_spiral_polar_to_cartesian_mapping(
     num_radius: int,
     max_radius: float,
     center: tuple[float, float],
-    spacing_ratio_relative_to_cartesian: float = 0.8,
+    c: float = 0.3,
     percent_arc_offset: float = 0.322,
 ) -> np.ndarray:
     """Inverse mapping for warping cartesian image to spiral polar space.
@@ -294,8 +267,9 @@ def inverse_spiral_polar_to_cartesian_mapping(
     center : tuple[float, float]
         Center point (row, col) of the polar coordinate system in the input cartesian
         image.
-    spacing_ratio_relative_to_cartesian : float, optional
-        Target node-spacing ratio; see module docstring. Default 0.8.
+    c : float, optional
+        Free linear-to-sqrt growth transition parameter; see module docstring.
+        Must be ``> 0``. Default 0.3.
     percent_arc_offset : float, optional
         Fraction of a full turn rotated per radial step; see module docstring.
         Default 0.322.
@@ -308,13 +282,7 @@ def inverse_spiral_polar_to_cartesian_mapping(
     radius_idx = output_coords[:, 0]
     angle_idx = output_coords[:, 1]
 
-    c, dt, twist_rate = _spiral_geometry(
-        num_angle,
-        num_radius,
-        max_radius,
-        spacing_ratio_relative_to_cartesian,
-        percent_arc_offset,
-    )
+    dt, twist_rate = _spiral_geometry(num_angle, num_radius, c, percent_arc_offset)
 
     t = (radius_idx + 1) * dt
     radius = _radius_from_t(t, max_radius, c)
@@ -334,7 +302,7 @@ def inverse_cartesian_to_spiral_polar_mapping(
     num_radius: int,
     max_radius: float,
     center: tuple[float, float],
-    spacing_ratio_relative_to_cartesian: float = 0.8,
+    c: float = 0.3,
     percent_arc_offset: float = 0.322,
 ) -> np.ndarray:
     """Inverse mapping for warping spiral polar image back to cartesian space.
@@ -354,8 +322,9 @@ def inverse_cartesian_to_spiral_polar_mapping(
         Maximum radius for the polar coordinate system.
     center : tuple[float, float]
         Center point (row, col) of the polar coordinate system.
-    spacing_ratio_relative_to_cartesian : float, optional
-        Target node-spacing ratio; see module docstring. Default 0.8.
+    c : float, optional
+        Free linear-to-sqrt growth transition parameter; see module docstring.
+        Must be ``> 0``. Default 0.3.
     percent_arc_offset : float, optional
         Fraction of a full turn rotated per radial step; see module docstring.
         Default 0.322.
@@ -376,13 +345,7 @@ def inverse_cartesian_to_spiral_polar_mapping(
     angle = np.arctan2(dr, dc)
     angle = angle % (2 * np.pi)
 
-    c, dt, twist_rate = _spiral_geometry(
-        num_angle,
-        num_radius,
-        max_radius,
-        spacing_ratio_relative_to_cartesian,
-        percent_arc_offset,
-    )
+    dt, twist_rate = _spiral_geometry(num_angle, num_radius, c, percent_arc_offset)
 
     t = _t_from_radius(radius, max_radius, c)
     radius_idx = t / dt - 1
@@ -397,7 +360,7 @@ def jacobian_correction_spiral_polar(
     num_angle: int,
     num_radius: int,
     max_radius: float,
-    spacing_ratio_relative_to_cartesian: float = 0.8,
+    c: float = 0.3,
     percent_arc_offset: float = 0.322,
 ) -> np.ndarray:
     """Correction factor for area element in spiral polar coordinates.
@@ -415,8 +378,9 @@ def jacobian_correction_spiral_polar(
         Number of radial samples per arm in polar space.
     max_radius : float
         Maximum radius for the polar coordinate system.
-    spacing_ratio_relative_to_cartesian : float, optional
-        Target node-spacing ratio; see module docstring. Default 0.8.
+    c : float, optional
+        Free linear-to-sqrt growth transition parameter; see module docstring.
+        Must be ``> 0``. Default 0.3.
     percent_arc_offset : float, optional
         Fraction of a full turn rotated per radial step; see module docstring.
         Default 0.322.
@@ -426,13 +390,7 @@ def jacobian_correction_spiral_polar(
     area_elements : np.ndarray
         (num_radius,) array containing the Cartesian area of each spiral polar pixel.
     """
-    c, dt, _twist_rate = _spiral_geometry(
-        num_angle,
-        num_radius,
-        max_radius,
-        spacing_ratio_relative_to_cartesian,
-        percent_arc_offset,
-    )
+    dt, _twist_rate = _spiral_geometry(num_angle, num_radius, c, percent_arc_offset)
 
     radius_idx = np.arange(num_radius)
     t = (radius_idx + 1) * dt
@@ -487,10 +445,12 @@ class SpiralPolarTransform(CoordinateTransform):
         Height of the Cartesian image.
     width : int
         Width of the Cartesian image.
-    spacing_ratio_relative_to_cartesian : float, optional
-        Target ratio of longest spiral-node spacing to a reference
-        ``height x width`` Cartesian grid's spacing. Must be in ``(0, 1)``.
-        Default 0.8.
+    c : float, optional
+        Free scalar parameter (dimensionless, relative to ``radius``) controlling
+        the transition from linear to square-root radial growth; see module
+        docstring. Must be ``> 0``. Unlike a spacing-ratio-style parameterization,
+        any positive value is valid regardless of ``num_radius`` or ``radius``,
+        which makes ``c`` suitable for direct sweeping/optimization. Default 0.3.
     percent_arc_offset : float, optional
         Fraction of a full turn (``2*pi / num_angle``) the spiral rotates for
         each radial step outward. Default 0.322.
@@ -509,7 +469,7 @@ class SpiralPolarTransform(CoordinateTransform):
         num_radius: int,
         height: int,
         width: int,
-        spacing_ratio_relative_to_cartesian: float = 0.8,
+        c: float = 0.3,
         percent_arc_offset: float = 0.322,
     ) -> None:
         super().__init__()
@@ -519,15 +479,14 @@ class SpiralPolarTransform(CoordinateTransform):
         self.num_radius = num_radius
         self.height = height
         self.width = width
-        self.spacing_ratio_relative_to_cartesian = spacing_ratio_relative_to_cartesian
+        self.c = c
         self.percent_arc_offset = percent_arc_offset
 
         # Precompute derived scalar geometry once (cheap; not a coordinate grid).
-        self._c, self._dt, self._twist_rate = _spiral_geometry(
+        self._dt, self._twist_rate = _spiral_geometry(
             num_angle,
             num_radius,
-            radius,
-            spacing_ratio_relative_to_cartesian,
+            c,
             percent_arc_offset,
         )
 
@@ -539,7 +498,7 @@ class SpiralPolarTransform(CoordinateTransform):
         num_angle: int | None = None,
         center: tuple[float, float] | None = None,
         radius: float | None = None,
-        spacing_ratio_relative_to_cartesian: float = 0.8,
+        c: float = 0.3,
         percent_arc_offset: float = 0.322,
     ) -> "SpiralPolarTransform":
         """Convenience constructor from image shape and spiral polar geometry.
@@ -557,8 +516,10 @@ class SpiralPolarTransform(CoordinateTransform):
             ``(row, col)`` centre. Defaults to image centre.
         radius : float | None, optional
             Maximum radius in pixels. Defaults to ``height / 2``.
-        spacing_ratio_relative_to_cartesian : float, optional
-            Target node-spacing ratio; see module docstring. Default 0.8.
+        c : float, optional
+            Free linear-to-sqrt radial growth transition parameter passed through
+            to the transform; see module docstring and the class docstring.
+            Must be ``> 0``. Default 0.3.
         percent_arc_offset : float, optional
             Fraction of a full turn rotated per radial step; see module
             docstring. Default 0.322.
@@ -579,9 +540,7 @@ class SpiralPolarTransform(CoordinateTransform):
             num_radius = int(np.ceil(radius))
 
         if num_angle is None:
-            num_angle = round(
-                (height * width / num_radius) / spacing_ratio_relative_to_cartesian
-            )
+            num_angle = round(height * width / num_radius)
 
         return get_transform(  # type: ignore[return-value]
             cls,
@@ -591,7 +550,7 @@ class SpiralPolarTransform(CoordinateTransform):
             num_radius=num_radius,
             height=height,
             width=width,
-            spacing_ratio_relative_to_cartesian=spacing_ratio_relative_to_cartesian,
+            c=c,
             percent_arc_offset=percent_arc_offset,
         )
 
@@ -635,7 +594,7 @@ class SpiralPolarTransform(CoordinateTransform):
             num_radius=self.num_radius,
             max_radius=self.radius,
             center=self.center,
-            spacing_ratio_relative_to_cartesian=self.spacing_ratio_relative_to_cartesian,
+            c=self.c,
             percent_arc_offset=self.percent_arc_offset,
         )
 
@@ -664,7 +623,7 @@ class SpiralPolarTransform(CoordinateTransform):
             num_radius=self.num_radius,
             max_radius=self.radius,
             center=self.center,
-            spacing_ratio_relative_to_cartesian=self.spacing_ratio_relative_to_cartesian,
+            c=self.c,
             percent_arc_offset=self.percent_arc_offset,
         )
 
@@ -687,7 +646,7 @@ class SpiralPolarTransform(CoordinateTransform):
             self.num_angle,
             self.num_radius,
             self.radius,
-            self.spacing_ratio_relative_to_cartesian,
+            self.c,
             self.percent_arc_offset,
         )
         jac_sqrt = np.sqrt(jac_1d).astype(np.float32)
@@ -709,9 +668,7 @@ class SpiralPolarTransform(CoordinateTransform):
             "num_radius": int(self.num_radius),
             "height": int(self.height),
             "width": int(self.width),
-            "spacing_ratio_relative_to_cartesian": float(
-                self.spacing_ratio_relative_to_cartesian
-            ),
+            "c": float(self.c),
             "percent_arc_offset": float(self.percent_arc_offset),
         }
 
@@ -730,8 +687,6 @@ class SpiralPolarTransform(CoordinateTransform):
             num_radius=int(params["num_radius"]),
             height=int(params["height"]),
             width=int(params["width"]),
-            spacing_ratio_relative_to_cartesian=float(
-                params["spacing_ratio_relative_to_cartesian"]
-            ),
+            c=float(params["c"]),
             percent_arc_offset=float(params["percent_arc_offset"]),
         )
