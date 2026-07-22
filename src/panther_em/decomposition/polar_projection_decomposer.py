@@ -1,6 +1,7 @@
 """Polar projection decomposition for cryo-EM volumes."""
 
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
@@ -11,6 +12,54 @@ from panther_em.decomposition.result import DecompositionResult
 from panther_em.inference.projection_reconstruction import ProjectionReconstructor
 
 from .pipeline_projections import do_pipelined_projection_and_transforms
+
+_LOW_RANK_OVERSAMPLE = 20  # roughly 10 percent margin
+_LOW_RANK_NITER = 2  # PyTorch default
+
+
+def _dense_svd_block(
+    freq_blocks: torch.Tensor, eig_max: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute a full SVD and truncate to the top ``eig_max`` components.
+
+    Parameters
+    ----------
+    freq_blocks : torch.Tensor
+        Batched matrices of shape ``(num_k_batch, rows, num_radius)``.
+    eig_max : int
+        Number of leading singular components to keep.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        Truncated ``(u, s, vh)`` each with ``eig_max`` leading components.
+    """
+    u, s, vh = torch.linalg.svd(freq_blocks, full_matrices=False)
+    return u[..., :eig_max], s[..., :eig_max], vh[..., :eig_max, :]
+
+
+def _lowrank_svd_block(
+    freq_blocks: torch.Tensor, eig_max: int, num_radius: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute a randomized low-rank SVD truncated to the top ``eig_max`` components.
+
+    Parameters
+    ----------
+    freq_blocks : torch.Tensor
+        Batched matrices of shape ``(num_k_batch, rows, num_radius)``.
+    eig_max : int
+        Number of leading singular components to keep.
+    num_radius : int
+        Number of columns in ``freq_blocks`` (upper bound for the oversampled rank).
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        Truncated ``(u, s, vh)`` each with ``eig_max`` leading components.
+    """
+    q = min(eig_max + _LOW_RANK_OVERSAMPLE, num_radius)
+    u, s, v = torch.svd_lowrank(freq_blocks, q=q, niter=_LOW_RANK_NITER)
+    return u[..., :eig_max], s[..., :eig_max], v[..., :eig_max].mH
 
 
 class PolarProjectionDecomposer:
@@ -145,6 +194,7 @@ class PolarProjectionDecomposer:
         eig_max: int | None = None,
         projection_batch_size: int = 128,
         block_batch_size: int = 8,
+        svd_method: Literal["dense", "low_rank"] = "dense",
     ) -> DecompositionResult:
         """Run the block-circulant decomposition using the held orientations.
 
@@ -169,12 +219,28 @@ class PolarProjectionDecomposer:
         block_batch_size : int, optional
             Number of frequency blocks to process at a time on GPU for SVD.
             Default is 8.
+        svd_method : Literal["dense", "low_rank"], optional
+            Algorithm used for the per-frequency-block SVD. ``"dense"`` computes the
+            full SVD via `torch.linalg.svd` and truncates to `eig_max` components.
+            ``"low_rank"`` uses a randomized low-rank SVD (`torch.svd_lowrank`) that
+            targets `eig_max` components directly, which is substantially faster when
+            `num_radius` (the number of radial components) is much larger than
+            `eig_max`.
 
         Returns
         -------
         DecompositionResult
             The decomposition result containing singular values and vectors.
+
+        Raises
+        ------
+        ValueError
+            If `svd_method` is not one of "dense" or "low_rank".
         """
+        if svd_method not in ("dense", "low_rank"):
+            raise ValueError(
+                f"svd_method must be 'dense' or 'low_rank', got {svd_method!r}"
+            )
         ### Stage 1: GPU projection generation and transform.
 
         # Transforms are device-agnostic; GPU dispatch is handled internally.
@@ -242,11 +308,10 @@ class PolarProjectionDecomposer:
             # since we want SVD to operate on (rows, num_r)
             freq_blocks = freq_blocks.permute(1, 0, 2)
 
-            u, s, vh = torch.linalg.svd(freq_blocks, full_matrices=False)
-
-            u = u[..., :eig_max]
-            s = s[:, :eig_max]
-            vh = vh[:, :eig_max, :]
+            if svd_method == "dense":
+                u, s, vh = _dense_svd_block(freq_blocks, eig_max)
+            else:
+                u, s, vh = _lowrank_svd_block(freq_blocks, eig_max, num_radius)
 
             # Reshape outer indices for storage
             u_reshaped = u.permute(1, 0, 2)
