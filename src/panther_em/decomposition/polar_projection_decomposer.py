@@ -72,16 +72,22 @@ class PolarProjectionDecomposer:
     Parameters
     ----------
     volume : np.ndarray | torch.Tensor
-        The 3D volume to decompose.
+        The 3D volume(s) to decompose. Either a single `(d, d, d)` volume or a stack of
+        `(num_volumes, d, d, d)` volumes. A single volume is treated as `num_volumes=1`.
     phi_values : np.ndarray | torch.Tensor
-        Phi values, in degrees of ZYZ Euler angles, for projection orientations.
+        Phi values, in degrees of ZYZ Euler angles, for projection orientations. Shared
+        across all volumes.
     theta_values : np.ndarray | torch.Tensor
         Theta values, in degrees of ZYZ Euler angles, for projection orientations.
+        Shared across all volumes.
     coordinate_transform : CoordinateTransform
         Pre-built coordinate transform that defines the polar-space geometry.
     fourier_filters : np.ndarray | torch.Tensor | None, optional
         Pre-computed Fourier-space filters to apply during projection. Default is None
         (identity filter).
+    volume_labels : np.ndarray | torch.Tensor | None, optional
+        Optional per-volume labels/coordinates (e.g. a conformation/state coordinate
+        value), shape `(num_volumes,)`. Default is None.
     device : str | torch.device, optional
         Compute device ('cpu', 'cuda', 'cuda:0', etc.). Default is 'cpu'.
 
@@ -101,6 +107,7 @@ class PolarProjectionDecomposer:
         theta_values: np.ndarray | torch.Tensor,
         coordinate_transform: CoordinateTransform,
         fourier_filters: np.ndarray | torch.Tensor | None = None,
+        volume_labels: np.ndarray | torch.Tensor | None = None,
         device: str | torch.device = "cpu",
     ) -> None:
         """Initialize the polar projection decomposer."""
@@ -125,8 +132,27 @@ class PolarProjectionDecomposer:
         if isinstance(fourier_filters, np.ndarray):
             fourier_filters = torch.from_numpy(fourier_filters.copy())
 
+        if isinstance(volume_labels, np.ndarray):
+            volume_labels = torch.from_numpy(volume_labels.copy())
+
+        if volume.ndim == 3:
+            volume = volume.unsqueeze(0)
+        elif volume.ndim != 4:
+            raise ValueError(
+                "volume must have shape (d, d, d) or (num_volumes, d, d, d), "
+                f"got {tuple(volume.shape)}"
+            )
+        self.volume = volume
+        self.num_volumes = volume.shape[0]
+
+        if volume_labels is not None and volume_labels.shape != (self.num_volumes,):
+            raise ValueError(
+                f"volume_labels shape {tuple(volume_labels.shape)} does not match "
+                f"(num_volumes,) = ({self.num_volumes},)"
+            )
+        self.volume_labels = volume_labels
+
         # Send to the target device
-        self.volume = volume.to(self.device)
         self.phi_values = phi_values.to(self.device)
         self.theta_values = theta_values.to(self.device)
         self.fourier_filters = (
@@ -271,6 +297,7 @@ class PolarProjectionDecomposer:
                 k_max=k_max,
                 storage_backend=storage_backend,
                 mmap_path=mmap_path,
+                device=self.device,
             )
         )
 
@@ -344,6 +371,9 @@ class PolarProjectionDecomposer:
             else None
         )
         num_angle = result_transform.polar_shape[0]
+        volume_labels_np = (
+            self.volume_labels.cpu().numpy() if self.volume_labels is not None else None
+        )
         self._result = DecompositionResult(
             S=S.cpu().numpy().astype(np.float32),
             U=U.cpu().numpy(),
@@ -351,64 +381,81 @@ class PolarProjectionDecomposer:
             k_max=k_max,
             eig_max=eig_max,
             is_complex_projection=is_complex,
-            num_fourier_filters=batch_shape[0],
-            num_orientations=batch_shape[1],
+            num_volumes=batch_shape[0],
+            num_fourier_filters=batch_shape[1],
+            num_orientations=batch_shape[2],
             num_angular_components=num_angle,
             num_radial_components=num_radius,
             phi_values=self.phi_values.cpu().numpy(),
             theta_values=self.theta_values.cpu().numpy(),
             fourier_filters=fourier_filters_np,
+            volume_labels=volume_labels_np,
             coordinate_transform=result_transform,
         )
 
         return self._result
 
-    @classmethod
-    def from_result(
-        cls,
-        result: DecompositionResult | str | Path,
-        volume: np.ndarray | torch.Tensor,
-        device: str | torch.device = "cpu",
-    ) -> "PolarProjectionDecomposer":
-        """Create a decomposer from a pre-computed (or loaded) result.
+    # @classmethod
+    # def from_result(
+    #     cls,
+    #     result: DecompositionResult | str | Path,
+    #     volume: np.ndarray | torch.Tensor,
+    #     device: str | torch.device = "cpu",
+    # ) -> "PolarProjectionDecomposer":
+    #     """Create a decomposer from a pre-computed (or loaded) result.
 
-        Parameters
-        ----------
-        result : DecompositionResult | str | Path
-            A :class:`~panther_em.decomposition.result.DecompositionResult`
-            instance or a path to a saved ``.h5`` file.
-        volume : np.ndarray | torch.Tensor
-            The original 3D volume (needed if further decomposition will be run).
-        device : str | torch.device, optional
-            Compute device. Default is 'cpu'.
+    #     Parameters
+    #     ----------
+    #     result : DecompositionResult | str | Path
+    #         A :class:`~panther_em.decomposition.result.DecompositionResult`
+    #         instance or a path to a saved ``.h5`` file.
+    #     volume : np.ndarray | torch.Tensor
+    #         The original volume(s) (needed if further decomposition will be run).
+    #         Either a single `(d, d, d)` volume or a stack of `(num_volumes, d, d, d)`
+    #         volumes, matching ``result.num_volumes``.
+    #     device : str | torch.device, optional
+    #         Compute device. Default is 'cpu'.
 
-        Returns
-        -------
-        PolarProjectionDecomposer
-            Decomposer instance pre-loaded with the given result.
-        """
-        if isinstance(result, (str, Path)):
-            result = DecompositionResult.load(result)
+    #     Returns
+    #     -------
+    #     PolarProjectionDecomposer
+    #         Decomposer instance pre-loaded with the given result.
 
-        if result.coordinate_transform is None:
-            raise ValueError(
-                "The loaded DecompositionResult has no embedded coordinate_transform. "
-                "Re-run decomposition with the current code to produce a result that "
-                "contains the transform."
-            )
+    #     Raises
+    #     ------
+    #     ValueError
+    #         If the number of volumes provided does not match
+    #         ``result.num_volumes``.
+    #     """
+    #     if isinstance(result, (str, Path)):
+    #         result = DecompositionResult.load(result)
 
-        device_obj = torch.device(device)
+    #     if result.coordinate_transform is None:
+    #         raise ValueError(
+    #             "The loaded DecompositionResult has no embedded coordinate_transform."
+    #             " Re-run decomposition with the current code to produce a result that"
+    #             " contains the transform."
+    #         )
 
-        phi_values = torch.zeros(result.num_orientations, device=device_obj)
-        theta_values = torch.zeros(result.num_orientations, device=device_obj)
+    #     device_obj = torch.device(device)
 
-        instance = cls(
-            volume,
-            phi_values,
-            theta_values,
-            coordinate_transform=result.coordinate_transform,
-            device=device_obj,
-        )
-        instance._result = result
+    #     phi_values = torch.zeros(result.num_orientations, device=device_obj)
+    #     theta_values = torch.zeros(result.num_orientations, device=device_obj)
 
-        return instance
+    #     instance = cls(
+    #         volume,
+    #         phi_values,
+    #         theta_values,
+    #         coordinate_transform=result.coordinate_transform,
+    #         device=device_obj,
+    #     )
+
+    #     if instance.num_volumes != result.num_volumes:
+    #         raise ValueError(
+    #             f"Number of volumes provided ({instance.num_volumes}) does not match "
+    #             f"result.num_volumes ({result.num_volumes})."
+    #         )
+
+    #     instance._result = result
+
+    #     return instance

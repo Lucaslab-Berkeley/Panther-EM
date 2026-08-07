@@ -338,6 +338,7 @@ class _ProjectionBuffer(ABC):
     def write_batch(
         self,
         gpu_result: torch.Tensor,
+        vol_idx: int,
         dest_slice: slice,
     ) -> None:
         """Accept one batch of GPU results and write to the output buffer.
@@ -347,6 +348,8 @@ class _ProjectionBuffer(ABC):
         gpu_result : torch.Tensor
             `(F, B, num_angular_mode, num_radius)` complex64 tensor on the compute
             device.
+        vol_idx : int
+            Volume-axis index into the full output buffer.
         dest_slice : slice
             Orientation-axis slice into the full output buffer.
         """
@@ -373,10 +376,11 @@ class _OnDeviceBuffer(_ProjectionBuffer):
     def write_batch(
         self,
         gpu_result: torch.Tensor,
+        vol_idx: int,
         dest_slice: slice,
     ) -> None:
         bmin, bmax = self._block_index_min, self._block_index_max
-        self._output[:, dest_slice] = gpu_result[:, :, bmin:bmax, :]
+        self._output[vol_idx, :, dest_slice] = gpu_result[:, :, bmin:bmax, :]
 
     def finalize(self) -> torch.Tensor:
         if self._output.is_cuda:
@@ -409,10 +413,11 @@ class _HostStagingBuffer(_ProjectionBuffer):
     def write_batch(
         self,
         gpu_result: torch.Tensor,
+        vol_idx: int,
         dest_slice: slice,
     ) -> None:
         bmin, bmax = self._block_index_min, self._block_index_max
-        self._output[:, dest_slice].copy_(gpu_result[:, :, bmin:bmax, :])
+        self._output[vol_idx, :, dest_slice].copy_(gpu_result[:, :, bmin:bmax, :])
 
     def finalize(self) -> torch.Tensor:
         return self._output
@@ -433,15 +438,16 @@ def do_pipelined_projection_and_transforms(
     k_max: int | None = None,
     storage_backend: Literal["on_device", "cpu", "mmap"] = "cpu",
     mmap_path: Path | str | None = None,
+    device: str | torch.device | None = None,
 ) -> tuple[torch.Tensor, bool, int]:
     """Pipelined generation and transforms of projections in polar coordinates.
 
     Parameters
     ----------
     volume : torch.Tensor
-        `(d, d, d)` cubic volume on GPU.
+        `(num_volumes, d, d, d)` stack of cubic volumes.
     phi, theta, psi : torch.Tensor
-        `(N,)` Euler angles in degrees.
+        `(N,)` Euler angles in degrees, shared across all volumes.
     fourier_filters : torch.Tensor | None
         `(f, h, w // 2 + 1)` Fourier-space filters, or None for identity.
     transformer : CoordinateTransform
@@ -477,16 +483,19 @@ def do_pipelined_projection_and_transforms(
         Path for the memory-mapped intermediate file.  Required when
         ``storage_backend="mmap"``, ignored otherwise.  The file is created (or
         overwritten) in ``'w+'`` mode as a raw complex64 array.
+    device : str | torch.device | None
+        Compute device that each volume is transferred to before projecting. If None,
+        uses ``volume.device``. Default is None.
 
     Returns
     -------
     torch.Tensor
-        `(num_fourier_filters, num_projections, num_freq_block, num_radius)`
-        complex64 tensor.  Resides on the compute device when
-        ``storage_backend="on_device"``, on CPU otherwise.  When underlying
-        projections are complex, the angular dim has been fft-shifted so that
-        indices correspond to ``[-k_max, ..., 0, ..., k_max - 1]``; for real
-        projections it corresponds to ``[0, 1, ..., k_max - 1]``.
+        `(num_volumes, num_fourier_filters, num_projections, num_freq_block,
+        num_radius)` complex64 tensor.  Resides on the compute device when
+        ``storage_backend="on_device"``, on CPU otherwise.  When underlying projections
+        are complex, the angular dim has been fft-shifted so that indices correspond to
+        ``[-k_max, ..., 0, ..., k_max - 1]``; for real projections it corresponds to
+        ``[0, 1, ..., k_max - 1]``.
     bool
         Whether the projections are complex-valued.
     int
@@ -494,35 +503,37 @@ def do_pipelined_projection_and_transforms(
     """
     if storage_backend == "mmap" and mmap_path is None:
         raise ValueError("mmap_path must be provided when storage_backend='mmap'")
+    if volume.ndim != 4:
+        raise ValueError(
+            f"volume must have shape (num_volumes, d, d, d), got {tuple(volume.shape)}"
+        )
 
     num_radius = transformer.polar_shape[1]
+    num_volumes = volume.shape[0]
+    compute_device = torch.device(device) if device is not None else volume.device
 
     if fourier_filters is None:
         filter_shape = (
-            (1, volume.shape[1], volume.shape[2])
+            (1, volume.shape[-2], volume.shape[-1])
             if torch.is_complex(volume)
-            else (1, volume.shape[1], volume.shape[2] // 2 + 1)
+            else (1, volume.shape[-2], volume.shape[-1] // 2 + 1)
         )
         fourier_filters = torch.ones(
-            filter_shape, device=volume.device, dtype=torch.complex64
+            filter_shape, device=compute_device, dtype=torch.complex64
         )
+    else:
+        fourier_filters = fourier_filters.to(compute_device)
 
-    compute_device = volume.device
-
-    # Precompute the 3D RFFT once — stays on GPU for the entire pipeline
-    dft, volume_mean_scaled, pad_width = precompute_volume_dft(
-        volume, pad_factor=pad_factor
+    # NOTE: Doing a dummy batch on the first volume before allocating memory to get
+    #       the `is_complex` flag and the number of angular modes which need stored.
+    #       Orientations/filters/k_max are assumed identical across all volumes.
+    dft0, volume_mean_scaled0, pad_width0 = precompute_volume_dft(
+        volume[0].to(compute_device, non_blocking=True), pad_factor=pad_factor
     )
-
-    # Free the original volume from GPU since we only need the DFT now
-    del volume
-
-    # NOTE: Doing a dummy batch before allocating memory to get the `is_complex` flag
-    #       and the number of angular modes which need stored
     _, is_complex, num_angular_mode = process_batch(
-        dft=dft,
-        volume_mean_scaled=volume_mean_scaled,
-        pad_width=pad_width,
+        dft=dft0,
+        volume_mean_scaled=volume_mean_scaled0,
+        pad_width=pad_width0,
         phi=phi[:2],
         theta=theta[:2],
         psi=psi[:2],
@@ -539,7 +550,13 @@ def do_pipelined_projection_and_transforms(
 
     num_orientations = phi.shape[0]
     num_filters = fourier_filters.shape[0]
-    buffer_shape = (num_filters, num_orientations, num_freq_block, num_radius)
+    buffer_shape = (
+        num_volumes,
+        num_filters,
+        num_orientations,
+        num_freq_block,
+        num_radius,
+    )
 
     if storage_backend == "on_device":
         buffer: _ProjectionBuffer = _OnDeviceBuffer(
@@ -556,43 +573,53 @@ def do_pipelined_projection_and_transforms(
     pbar = None
     if show_progress:
         pbar = tqdm.tqdm(
-            total=num_orientations,
+            total=num_volumes * num_orientations,
             desc="calc. projections",
             unit="proj",
             unit_scale=num_filters,
         )
 
-    for start_idx in range(0, num_orientations, projection_batch_size):
-        end_idx = min(start_idx + projection_batch_size, num_orientations)
-        slice_ = slice(start_idx, end_idx)
-        batch_size = end_idx - start_idx
+    for vol_idx in range(num_volumes):
+        if vol_idx == 0:
+            dft, volume_mean_scaled, pad_width = dft0, volume_mean_scaled0, pad_width0
+        else:
+            vol_i = volume[vol_idx].to(compute_device, non_blocking=True)
+            dft, volume_mean_scaled, pad_width = precompute_volume_dft(
+                vol_i, pad_factor=pad_factor
+            )
+            del vol_i
 
-        result, is_complex, _ = process_batch(
-            dft=dft,
-            volume_mean_scaled=volume_mean_scaled,
-            pad_width=pad_width,
-            phi=phi[slice_],
-            theta=theta[slice_],
-            psi=psi[slice_],
-            fourier_filters=fourier_filters,
-            transformer=transformer,
-            warp_polar_kwargs=warp_polar_kwargs,
-            fftfreq_max=fftfreq_max,
-        )
+        for start_idx in range(0, num_orientations, projection_batch_size):
+            end_idx = min(start_idx + projection_batch_size, num_orientations)
+            slice_ = slice(start_idx, end_idx)
+            batch_size = end_idx - start_idx
 
-        if is_complex:
-            result = torch.fft.fftshift(result, dim=-3)
+            result, is_complex, _ = process_batch(
+                dft=dft,
+                volume_mean_scaled=volume_mean_scaled,
+                pad_width=pad_width,
+                phi=phi[slice_],
+                theta=theta[slice_],
+                psi=psi[slice_],
+                fourier_filters=fourier_filters,
+                transformer=transformer,
+                warp_polar_kwargs=warp_polar_kwargs,
+                fftfreq_max=fftfreq_max,
+            )
 
-        buffer.write_batch(result, slice_)
-        del result
+            if is_complex:
+                result = torch.fft.fftshift(result, dim=-3)
 
-        if pbar is not None:
-            pbar.update(batch_size)
+            buffer.write_batch(result, vol_idx, slice_)
+            del result
+
+            if pbar is not None:
+                pbar.update(batch_size)
+
+        del dft
 
     if pbar is not None:
         pbar.close()
-
-    del dft
 
     output = buffer.finalize()
     return output, is_complex, k_max_actual

@@ -143,7 +143,7 @@ def compute_feature_stack(
 
 
 def compute_weights(result: DecompositionResult, indices: torch.Tensor) -> torch.Tensor:
-    """Extract weights ``W[ff, orient, n] = U[ff, orient, k, eig] * S[k, eig]``.
+    """Extract weights ``W[vol, ff, ort, n] = U[vol, ff, ort, k, eig] * S[k, eig]``.
 
     Parameters
     ----------
@@ -159,7 +159,8 @@ def compute_weights(result: DecompositionResult, indices: torch.Tensor) -> torch
     Returns
     -------
     torch.Tensor
-        Complex64 tensor of shape ``(num_fourier_filters, num_orientations, N)``.
+        Complex64 tensor of shape
+        ``(num_volumes, num_fourier_filters, num_orientations, N)``.
     """
     device = indices.device
 
@@ -167,7 +168,7 @@ def compute_weights(result: DecompositionResult, indices: torch.Tensor) -> torch
     S = torch.from_numpy(result.S)
 
     # Send to device and ensure correct dtype
-    U = U.to(dtype=torch.complex64, device=device)  # (FF, O, num_blocks, eig_max)
+    U = U.to(dtype=torch.complex64, device=device)  # (V, FF, O, num_blocks, eig_max)
     S = S.to(dtype=torch.complex64, device=device)  # (num_blocks, eig_max)
 
     k_freq = indices[:, 0]  # (L,) — actual angular frequencies
@@ -181,7 +182,7 @@ def compute_weights(result: DecompositionResult, indices: torch.Tensor) -> torch
     else:
         k_stored = k_freq.abs()
 
-    U_selected = U[:, :, k_stored, eig_idx]  # (FF, O, L)
+    U_selected = U[:, :, :, k_stored, eig_idx]  # (V, FF, O, L)
     S_selected = S[k_stored, eig_idx]  # (L,)
 
     weights = U_selected * S_selected
@@ -192,7 +193,7 @@ def compute_weights(result: DecompositionResult, indices: torch.Tensor) -> torch
         neg_mask = k_freq < 0
         if neg_mask.any():
             weights = weights.clone()
-            weights[:, :, neg_mask] = weights[:, :, neg_mask].conj()
+            weights[:, :, :, neg_mask] = weights[:, :, :, neg_mask].conj()
 
     return weights
 
@@ -203,8 +204,8 @@ def contract_features(weights: torch.Tensor, features: torch.Tensor) -> torch.Te
     Parameters
     ----------
     weights : torch.Tensor
-        Shape `(FF, O, L)` complex weights for the `L` selected
-        components across all Fourier-filter / orientation pairs.
+        Shape `(V, FF, O, L)` complex weights for the `L` selected
+        components across all volume / Fourier-filter / orientation triples.
     features : torch.Tensor
         Shape `(L, H, W)` or `(B, L, H, W)` complex feature stack
         from :func:`compute_feature_stack`.
@@ -212,11 +213,12 @@ def contract_features(weights: torch.Tensor, features: torch.Tensor) -> torch.Te
     Returns
     -------
     torch.Tensor
-        Complex correlogram of shape `(FF, O, H, W)` or `(B, FF, O, H, W)`.
+        Complex correlogram of shape `(V, FF, O, H, W)` or
+        `(B, V, FF, O, H, W)`.
     """
     if features.dim() == 3:
-        return torch.einsum("fol, lhw -> fohw", weights, features)
-    return torch.einsum("fol, blhw -> bfohw", weights, features)
+        return torch.einsum("vfol, lhw -> vfohw", weights, features)
+    return torch.einsum("vfol, blhw -> bvfohw", weights, features)
 
 
 # ---------------------------------------------------------------------------
@@ -292,8 +294,8 @@ def compute_correlogram(
     -------
     torch.Tensor
         Complex correlogram on `reconstructor.device` of shape
-        `(B, FF, O, H, W)` or `(FF, O, H, W)`, where
-        `FF = num_fourier_filters`, `O = num_orientations`.
+        `(B, V, FF, O, H, W)` or `(V, FF, O, H, W)`, where
+        `V = num_volumes`, `FF = num_fourier_filters`, `O = num_orientations`.
 
     Raises
     ------
@@ -304,7 +306,7 @@ def compute_correlogram(
     --------
     >>> reconstructor = ProjectionReconstructor(result, image_shape=(256, 256))
     >>> C = compute_correlogram(micrograph_patch, reconstructor, top_k=32, chunk_size=8)
-    >>> C.shape  # e.g. (1, num_fourier_filters, num_orientations, 256, 256)
+    >>> C.shape  # e.g. (1, num_volumes, num_filters, num_orientations, 256, 256)
     """
     result = reconstructor.result
     device = reconstructor.device
@@ -317,8 +319,10 @@ def compute_correlogram(
 
     _has_batch = image.dim() == 4
     B = image.shape[0] if _has_batch else None
-    FF, OR = result.num_fourier_filters, result.num_orientations
-    out_shape = (B, FF, OR, out_H, out_W) if _has_batch else (FF, OR, out_H, out_W)
+    V, FF, OR = result.num_volumes, result.num_fourier_filters, result.num_orientations
+    out_shape = (
+        (B, V, FF, OR, out_H, out_W) if _has_batch else (V, FF, OR, out_H, out_W)
+    )
 
     accumulator = torch.zeros(out_shape, dtype=torch.complex64, device=device)
     image = image.to(device)
@@ -437,13 +441,14 @@ def estimate_memory_bytes(
     kH = kW = result.num_radial_components
     H, W = image_shape[-2], image_shape[-1]
     B = image_shape[0] if len(image_shape) == 4 else 1
+    V = result.num_volumes
     FF = result.num_fourier_filters
     OR = result.num_orientations
 
     kernel_bytes = chunk * kH * kW * bpe  # (chunk, kH, kW)
     feature_bytes = B * chunk * H * W * bpe  # (B, chunk, H, W)
-    weight_bytes = FF * OR * chunk * bpe  # (FF, O, chunk)
-    acc_bytes = B * FF * OR * H * W * bpe  # (B, FF, O, H, W)
+    weight_bytes = V * FF * OR * chunk * bpe  # (V, FF, O, chunk)
+    acc_bytes = B * V * FF * OR * H * W * bpe  # (B, V, FF, O, H, W)
     total = kernel_bytes + feature_bytes + weight_bytes + acc_bytes
 
     return {
