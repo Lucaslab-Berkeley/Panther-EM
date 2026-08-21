@@ -44,19 +44,28 @@ class DecompositionResult:
     singular value magnitude; similar methods exist for retrieving the corresponding
     singular vectors and values.
 
+    Note on multiple volumes
+    -------------------------
+    When decomposition is run across multiple volumes (e.g. sampled across a
+    conformation/state coordinate), `U` gains a leading `num_volumes` axis while `S` and
+    `Vh` remain unchanged. The SVD basis is a single joint fit across all volumes's
+    `(fourier_filter, orientation)` samples simultaneously.
+
     Results are saved and loaded as HDF5 files (``.h5`` / ``.hdf5``) via
     :meth:`save` and :meth:`load`.
 
     Attributes
     ----------
     U : np.ndarray
-        Left singular vectors with shape
-        (num_fourier_filters, num_orientations, num_freq_blocks, num_radial_components).
+        Left singular vectors with shape (num_volumes, num_fourier_filters,
+        num_orientations, num_freq_blocks, num_radial_components).
     S : np.ndarray
         Singular values with shape (num_freq_blocks, num_radial_components).
     Vh : np.ndarray
         Right singular vectors (conjugate transpose) with shape
         (num_freq_blocks, num_radial_components, num_radial_components).
+    num_volumes : int
+        Number of volumes used in decomposition. Default is 1 (single-volume).
     num_fourier_filters : int
         Number of Fourier filters (defocus channels) used in decomposition.
     num_orientations : int
@@ -83,6 +92,9 @@ class DecompositionResult:
     fourier_filters : np.ndarray | None
         Fourier-space filters (e.g. CTF envelopes) applied during decomposition, shape
         ``(num_fourier_filters, ...)``. ``None`` if no filters were applied.
+    volume_labels : np.ndarray | None
+        Optional per-volume labels/coordinates (e.g. a conformation/state
+        coordinate value), shape ``(num_volumes,)``. ``None`` if not recorded.
     """
 
     # Core SVD components
@@ -100,6 +112,7 @@ class DecompositionResult:
     num_orientations: int
     num_angular_components: int
     num_radial_components: int
+    num_volumes: int = 1
 
     # Timestamp
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -110,6 +123,9 @@ class DecompositionResult:
 
     # Optional Fourier filters recorded at decomposition time
     fourier_filters: np.ndarray | None = None
+
+    # Optional per-volume labels/coordinates recorded at decomposition time
+    volume_labels: np.ndarray | None = None
 
     # Optional coordinate transform used during decomposition
     # When present, DecompositionResult.save() embeds the transform's geometric
@@ -124,6 +140,7 @@ class DecompositionResult:
             num_freq_blocks = self.k_max  # NOTE: need plus 1?
 
         expected_U_shape = (
+            self.num_volumes,
             self.num_fourier_filters,
             self.num_orientations,
             num_freq_blocks,
@@ -172,6 +189,14 @@ class DecompositionResult:
                     f"num_fourier_filters={self.num_fourier_filters}"
                 )
 
+        # Validate optional volume labels
+        if self.volume_labels is not None:
+            if self.volume_labels.shape != (self.num_volumes,):
+                raise ValueError(
+                    f"volume_labels shape {self.volume_labels.shape} does not match "
+                    f"expected ({self.num_volumes},)"
+                )
+
         # Per-instance cache for top-n queries
         self._top_n_cache: dict[tuple[int, bool], np.ndarray] = {}
 
@@ -187,6 +212,7 @@ class DecompositionResult:
                 k_max={self.k_max},
                 eig_max={self.eig_max},
                 is_complex_projection={self.is_complex_projection},
+                num_volumes={self.num_volumes},
                 num_fourier_filters={self.num_fourier_filters},
                 num_orientations={self.num_orientations},
                 num_angular_components={self.num_angular_components},
@@ -209,6 +235,7 @@ class DecompositionResult:
         f.attrs["k_max"] = self.k_max
         f.attrs["eig_max"] = self.eig_max
         f.attrs["is_complex_projection"] = self.is_complex_projection
+        f.attrs["num_volumes"] = self.num_volumes
         f.attrs["num_fourier_filters"] = self.num_fourier_filters
         f.attrs["num_orientations"] = self.num_orientations
         f.attrs["num_angular_components"] = self.num_angular_components
@@ -234,6 +261,8 @@ class DecompositionResult:
             f.create_dataset("theta_values", data=self.theta_values)
         if self.fourier_filters is not None:
             f.create_dataset("fourier_filters", data=self.fourier_filters)
+        if self.volume_labels is not None:
+            f.create_dataset("volume_labels", data=self.volume_labels)
 
     def _write_hdf5_transform_arrays(self, f: h5py.File) -> None:
         """Write coordinate grid arrays for a GridTransform into an HDF5 group."""
@@ -347,6 +376,7 @@ class DecompositionResult:
             k_max=self.k_max,
             eig_max=self.eig_max,
             is_complex_projection=self.is_complex_projection,
+            num_volumes=self.num_volumes,
             num_fourier_filters=self.num_fourier_filters,
             num_orientations=self.num_orientations,
             num_angular_components=self.num_angular_components,
@@ -356,6 +386,7 @@ class DecompositionResult:
             phi_values=self.phi_values,
             theta_values=self.theta_values,
             fourier_filters=self.fourier_filters,
+            volume_labels=self.volume_labels,
         )
 
     @classmethod
@@ -399,6 +430,9 @@ class DecompositionResult:
             k_max = int(f.attrs["k_max"])
             eig_max = int(f.attrs["eig_max"])
             is_complex = bool(f.attrs["is_complex_projection"])
+            # .get() with a default of 1 for backward compatibility with files
+            # saved before the multi-volume axis was introduced.
+            num_vol = int(f.attrs.get("num_volumes", 1))
             num_ff = int(f.attrs["num_fourier_filters"])
             num_or = int(f.attrs["num_orientations"])
             num_ang = int(f.attrs["num_angular_components"])
@@ -414,6 +448,7 @@ class DecompositionResult:
             fourier_filters = (
                 f["fourier_filters"][()] if "fourier_filters" in f else None
             )
+            volume_labels = f["volume_labels"][()] if "volume_labels" in f else None
 
             # Load coordinate transform — required; raise if absent or unreadable.
             if "transform_config" not in f.attrs:
@@ -460,6 +495,11 @@ class DecompositionResult:
             S = f["S"][()]
             Vh = f["Vh"][()]
 
+            # Legacy files (pre multi-volume support) stored U without the
+            # leading volume axis; insert it so num_volumes=1 is self-consistent.
+            if U.ndim == 4:
+                U = U[np.newaxis, ...]
+
             return cls(
                 U=U,
                 S=S,
@@ -467,6 +507,7 @@ class DecompositionResult:
                 k_max=k_max,
                 eig_max=eig_max,
                 is_complex_projection=is_complex,
+                num_volumes=num_vol,
                 num_fourier_filters=num_ff,
                 num_orientations=num_or,
                 num_angular_components=num_ang,
@@ -475,6 +516,7 @@ class DecompositionResult:
                 phi_values=phi_values,
                 theta_values=theta_values,
                 fourier_filters=fourier_filters,
+                volume_labels=volume_labels,
                 coordinate_transform=coordinate_transform,
             )
 
@@ -820,18 +862,20 @@ class SparseDecompositionResult(DecompositionResult):
         num_orientations: int,
         num_angular_components: int,
         num_radial_components: int,
+        num_volumes: int = 1,
         coordinate_transform: CoordinateTransform | None = None,
         created_at: str | None = None,
         phi_values: np.ndarray | None = None,
         theta_values: np.ndarray | None = None,
         fourier_filters: np.ndarray | None = None,
+        volume_labels: np.ndarray | None = None,
     ) -> "SparseDecompositionResult":
         """Construct from compact arrays.
 
         Parameters
         ----------
         U_data : np.ndarray
-            Left singular vectors, shape ``(num_ff, num_or, L)``.
+            Left singular vectors, shape ``(num_vol, num_ff, num_or, L)``.
         S_data : np.ndarray
             Singular values, shape ``(L,)``.
         Vh_data : np.ndarray
@@ -853,6 +897,8 @@ class SparseDecompositionResult(DecompositionResult):
             Number of angular components in polar space.
         num_radial_components : int
             Number of radial components in polar space.
+        num_volumes : int, optional
+            Number of volumes used in decomposition. Default is 1.
         coordinate_transform : CoordinateTransform | None, optional
             Coordinate transform embedded at decomposition time.
         created_at : str | None, optional
@@ -863,6 +909,8 @@ class SparseDecompositionResult(DecompositionResult):
             Theta Euler angles used during decomposition.
         fourier_filters : np.ndarray | None, optional
             Fourier-space filters applied during decomposition.
+        volume_labels : np.ndarray | None, optional
+            Per-volume labels/coordinates, shape ``(num_volumes,)``.
         """
         L = int(selected_indices.shape[0])
         if selected_indices.shape != (L, 2):
@@ -879,6 +927,7 @@ class SparseDecompositionResult(DecompositionResult):
         obj.k_max = k_max
         obj.eig_max = eig_max
         obj.is_complex_projection = is_complex_projection
+        obj.num_volumes = num_volumes
         obj.num_fourier_filters = num_fourier_filters
         obj.num_orientations = num_orientations
         obj.num_angular_components = num_angular_components
@@ -888,6 +937,7 @@ class SparseDecompositionResult(DecompositionResult):
         obj.phi_values = phi_values
         obj.theta_values = theta_values
         obj.fourier_filters = fourier_filters
+        obj.volume_labels = volume_labels
 
         obj._U_data = U_data
         obj._S_data = S_data
@@ -919,6 +969,7 @@ class SparseDecompositionResult(DecompositionResult):
 
         U_dense = np.zeros(
             (
+                self.num_volumes,
                 self.num_fourier_filters,
                 self.num_orientations,
                 num_freq_blocks,
@@ -943,6 +994,7 @@ class SparseDecompositionResult(DecompositionResult):
             k_max=self.k_max,
             eig_max=self.eig_max,
             is_complex_projection=self.is_complex_projection,
+            num_volumes=self.num_volumes,
             num_fourier_filters=self.num_fourier_filters,
             num_orientations=self.num_orientations,
             num_angular_components=self.num_angular_components,
@@ -951,6 +1003,7 @@ class SparseDecompositionResult(DecompositionResult):
             phi_values=self.phi_values,
             theta_values=self.theta_values,
             fourier_filters=self.fourier_filters,
+            volume_labels=self.volume_labels,
             coordinate_transform=self.coordinate_transform,
         )
 
@@ -998,6 +1051,7 @@ class SparseDecompositionResult(DecompositionResult):
             k_max=self.k_max,
             eig_max=self.eig_max,
             is_complex_projection=self.is_complex_projection,
+            num_volumes=self.num_volumes,
             num_fourier_filters=self.num_fourier_filters,
             num_orientations=self.num_orientations,
             num_angular_components=self.num_angular_components,
@@ -1007,6 +1061,7 @@ class SparseDecompositionResult(DecompositionResult):
             phi_values=self.phi_values,
             theta_values=self.theta_values,
             fourier_filters=self.fourier_filters,
+            volume_labels=self.volume_labels,
         )
 
     # ------------------------------------------------------------------
@@ -1066,7 +1121,12 @@ class SparseDecompositionResult(DecompositionResult):
 
         if return_u:
             u = np.zeros(
-                (self.num_fourier_filters, self.num_orientations, L_query),
+                (
+                    self.num_volumes,
+                    self.num_fourier_filters,
+                    self.num_orientations,
+                    L_query,
+                ),
                 dtype=np.complex64,
             )
             if found.any():
@@ -1200,6 +1260,9 @@ class SparseDecompositionResult(DecompositionResult):
             k_max = int(f.attrs["k_max"])
             eig_max = int(f.attrs["eig_max"])
             is_complex = bool(f.attrs["is_complex_projection"])
+            # .get() with a default of 1 for backward compatibility with files
+            # saved before the multi-volume axis was introduced.
+            num_vol = int(f.attrs.get("num_volumes", 1))
             num_ff = int(f.attrs["num_fourier_filters"])
             num_or = int(f.attrs["num_orientations"])
             num_ang = int(f.attrs["num_angular_components"])
@@ -1214,6 +1277,7 @@ class SparseDecompositionResult(DecompositionResult):
             fourier_filters = (
                 f["fourier_filters"][()] if "fourier_filters" in f else None
             )
+            volume_labels = f["volume_labels"][()] if "volume_labels" in f else None
 
             if "transform_config" not in f.attrs:
                 raise KeyError(
@@ -1259,6 +1323,11 @@ class SparseDecompositionResult(DecompositionResult):
             S_data = f["S"][()]
             Vh_data = f["Vh"][()]
 
+        # Legacy files (pre multi-volume support) stored U_data without the
+        # leading volume axis; insert it so num_volumes=1 is self-consistent.
+        if U_data.ndim == 3:
+            U_data = U_data[np.newaxis, ...]
+
         return cls.from_sparse_arrays(
             U_data=U_data,
             S_data=S_data,
@@ -1267,6 +1336,7 @@ class SparseDecompositionResult(DecompositionResult):
             k_max=k_max,
             eig_max=eig_max,
             is_complex_projection=is_complex,
+            num_volumes=num_vol,
             num_fourier_filters=num_ff,
             num_orientations=num_or,
             num_angular_components=num_ang,
@@ -1276,6 +1346,7 @@ class SparseDecompositionResult(DecompositionResult):
             phi_values=phi_values,
             theta_values=theta_values,
             fourier_filters=fourier_filters,
+            volume_labels=volume_labels,
         )
 
     # ------------------------------------------------------------------
@@ -1297,6 +1368,7 @@ class SparseDecompositionResult(DecompositionResult):
                 k_max={self.k_max},
                 eig_max={self.eig_max},
                 is_complex_projection={self.is_complex_projection},
+                num_volumes={self.num_volumes},
                 num_fourier_filters={self.num_fourier_filters},
                 num_orientations={self.num_orientations},
                 num_angular_components={self.num_angular_components},
